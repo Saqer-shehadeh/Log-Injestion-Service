@@ -51,7 +51,29 @@ const logBuffer = new RingBuffer<string>(200_000);
 // Adaptive worker: base batch 4000, flush interval 50ms. Concurrency is
 // fixed at 1 inside LogWorker (see its maxConcurrent comment).
 const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
-const fastify = Fastify({ logger: false });
+// CPU profiling under sustained ingestion put `secure-json-parse` at 24.7% of
+// total process CPU — more than every line of this codebase combined, and the
+// single largest consumer. Fastify's default JSON body parser runs two
+// prototype-pollution regexes across the *entire* raw body before parsing it;
+// at ingestion rates that is megabytes/sec of extra scanning per second.
+//
+// Setting both actions to 'ignore' makes secure-json-parse return straight
+// after JSON.parse and skip both scans (see its index.js line 37).
+//
+// Why that is safe *here* specifically: those scans protect code that later
+// merges parsed input into an existing object (Object.assign, a recursive
+// merge, target[key] = value). This service never does that. JSON.parse itself
+// does not invoke setters — a "__proto__" key becomes an ordinary own property
+// on the parsed object and cannot reach Object.prototype. The only things read
+// off the parsed body are fixed, named fields; `attributes` is validated to
+// contain nothing but string/number/boolean values and is then re-serialized
+// with JSON.stringify into a JSONB column. There is no merge anywhere on the
+// path, so there is nothing for a poisoned key to pollute.
+const fastify = Fastify({
+  logger: false,
+  onProtoPoisoning: 'ignore',
+  onConstructorPoisoning: 'ignore',
+});
 
 // Normalizes every error response to the API's {"error": "<description>"}
 // convention (used throughout query.ts/aggregate.ts's own 400s). Without

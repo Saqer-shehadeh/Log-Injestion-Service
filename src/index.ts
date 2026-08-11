@@ -14,10 +14,10 @@ const DB_URL = process.env.DATABASE_URL || 'postgres://loguser:logpass@localhost
 
 const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
 
-// Set synchronous_commit = off on every new PG connection for write throughput.
+// Set synchronous_commit = on on every new PG connection for write throughput.
 // Data is still WAL-logged — only fsync is deferred.  Acceptable for a log service.
 pgPool.on('connect', (client: any) => {
-  client.query('SET synchronous_commit = off');
+  client.query('SET synchronous_commit = on');
 });
 
 // Buffer stores pre-serialized TSV strings (not objects)

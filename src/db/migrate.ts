@@ -4,7 +4,7 @@ export async function initDb(pgPool: Pool) {
   // Apply DB-level performance settings
   try {
     await pgPool.query(`
-      ALTER SYSTEM SET synchronous_commit = 'off';
+      ALTER SYSTEM SET synchronous_commit = 'on';
       ALTER SYSTEM SET max_wal_size = '2GB';
       ALTER SYSTEM SET checkpoint_completion_target = '0.9';
       SELECT pg_reload_conf();

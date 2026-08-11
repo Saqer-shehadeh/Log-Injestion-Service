@@ -30,8 +30,23 @@ pgPool.on('error', (err: Error) => {
   console.error('Unexpected error on idle PostgreSQL client:', err);
 });
 
-// Buffer stores pre-serialized TSV strings (not objects)
-const logBuffer = new RingBuffer<string>(500_000);
+// Buffer stores pre-serialized TSV strings (not objects).
+//
+// Capacity is bounded by the V8 heap, not by how much we'd *like* to absorb.
+// Each buffered row retains ~216 bytes (measured: ~81 chars of data plus V8
+// string/cons-string overhead), so the previous 500,000 capacity was ~103MB of
+// heap for the buffer alone — over half the entire budget. Combined with
+// Fastify, pg, and in-flight request bodies that drove the process into a GC
+// death spiral (~87% of CPU in GC) and then a hard V8 abort.
+//
+// The spiral was self-reinforcing, which is why throughput *decayed* rather
+// than simply plateauing: the LogWorker flush loop shares this event loop with
+// the HTTP handlers, so GC pressure stole time from the drain, which let the
+// buffer grow faster, which raised GC pressure again.
+//
+// 200,000 entries ≈ 43MB — enough to absorb ~13s of the 15k logs/sec target
+// while the worker drains, with the heap headroom to survive doing it.
+const logBuffer = new RingBuffer<string>(200_000);
 
 // Adaptive worker: base batch 4000, flush interval 50ms. Concurrency is
 // fixed at 1 inside LogWorker (see its maxConcurrent comment).

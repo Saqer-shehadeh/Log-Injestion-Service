@@ -1,5 +1,6 @@
 import { FastifyPluginAsync } from 'fastify';
 import { Pool } from 'pg';
+import { isValidAttributeKey } from '../validation/log-validator';
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 
@@ -67,6 +68,9 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
     for (const key of Object.keys(q)) {
       if (key.startsWith('attr.')) {
         const attrKey = key.slice(5);
+        if (!isValidAttributeKey(attrKey)) {
+          return reply.status(400).send({ error: `Invalid attribute key format: '${attrKey}'` });
+        }
         conditions.push(`attributes->>'${attrKey}' = $${paramIdx++}`);
         values.push(q[key]);
       }

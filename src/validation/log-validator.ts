@@ -8,6 +8,11 @@ export interface ValidationResult {
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const ATTR_KEY_REGEX = /^[a-zA-Z0-9_.-]+$/;
+
+export function isValidAttributeKey(key: string): boolean {
+  return typeof key === 'string' && key.length > 0 && ATTR_KEY_REGEX.test(key);
+}
 
 export function validateLogEntry(entry: any, nowMs: number): ValidationResult {
   if (!entry || typeof entry !== 'object') {

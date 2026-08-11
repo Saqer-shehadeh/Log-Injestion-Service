@@ -100,7 +100,12 @@ test('LogWorker.shutdown()', async (t) => {
       calls++;
       return new FakeCopyStream({ delayMs: 40 }); // simulate a slow COPY
     });
-    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50);
+    // baseBatchSize is 5 here so the 5 buffered rows immediately satisfy the
+    // loop's minimum-batch condition. With the default 4000 the loop would
+    // (correctly) hold this partial batch for up to maxFlushDelayMs, and no
+    // COPY would be in flight when shutdown() is called — which is a valid
+    // behaviour, but not the one this test is about.
+    const worker = new LogWorker(buffer, pool as unknown as Pool, 5, 50);
 
     // start() synchronously fires the first flush cycle, which peeks the
     // batch and increments inFlight before this call returns.

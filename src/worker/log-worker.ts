@@ -29,6 +29,17 @@ export class LogWorker {
   // path, since ingestion only ever touches RingBuffer.push(), not this class.
   private shuttingDown = false;
 
+  // Timestamp of the last flush the loop started, used to bound how long a
+  // partial batch is allowed to wait (see maxFlushDelayMs).
+  private lastFlushAt = Date.now();
+
+  /**
+   * Upper bound on how long the loop will hold a partial batch waiting for it
+   * to reach baseBatchSize. Only affects persistence latency, never the HTTP
+   * response — ingestion acks as soon as the row is in the ring buffer.
+   */
+  private readonly maxFlushDelayMs = 200;
+
   constructor(
     private buffer: RingBuffer<string>,
     private pgPool: Pool,
@@ -58,9 +69,25 @@ export class LogWorker {
         const size = this.buffer.size();
 
         if (size > 0 && this.inFlight < this.maxConcurrent) {
-          const batchSize = this.getAdaptiveBatchSize(size);
-          this.fireFlush(batchSize);
-          await this.yieldTick();
+          // Wait for a worthwhile batch before paying the per-COPY cost.
+          //
+          // This loop used to flush the instant anything was in the buffer,
+          // so under steady load it issued a COPY per ~900 rows rather than
+          // per baseBatchSize. Each COPY carries fixed per-transaction cost
+          // (connection checkout, COPY setup, commit), so un-amortizing it
+          // that way measured ~10x slower for the same row count.
+          //
+          // maxFlushDelayMs keeps a low-traffic trickle from sitting in the
+          // buffer indefinitely waiting for a full batch that never arrives.
+          const waitedMs = Date.now() - this.lastFlushAt;
+          if (size >= this.baseBatchSize || waitedMs >= this.maxFlushDelayMs) {
+            const batchSize = this.getAdaptiveBatchSize(size);
+            this.lastFlushAt = Date.now();
+            this.fireFlush(batchSize);
+            await this.yieldTick();
+          } else {
+            await this.sleep(5);
+          }
         } else {
           await this.sleep(size > 0 ? 5 : this.flushIntervalMs);
         }

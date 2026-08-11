@@ -48,7 +48,7 @@ pgPool.on('error', (err: Error) => {
 // while the worker drains, with the heap headroom to survive doing it.
 const logBuffer = new RingBuffer<string>(200_000);
 
-// Adaptive worker: base batch 4000, flush interval 50ms. Concurrency is
+// Adaptive worker: base batch 4000, poll interval 50ms. Concurrency is
 // fixed at 1 inside LogWorker (see its maxConcurrent comment).
 const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
 // CPU profiling under sustained ingestion put `secure-json-parse` at 24.7% of

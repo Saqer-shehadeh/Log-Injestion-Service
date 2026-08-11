@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  build-and-unit-test:
+    name: Build, typecheck, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build (matches what the Docker image ships — test files excluded)
+        run: npm run build
+
+      - name: Unit tests
+        run: npm run test:unit
+
+  contract-smoke-test:
+    name: docker compose contract smoke test
+    runs-on: ubuntu-latest
+    needs: build-and-unit-test
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker compose up with zero extra configuration (no .env, no
+      # flags), then exercises all four required endpoints. No optional
+      # features (AUTH_ENABLED, rate limiting) are implemented, so per the
+      # spec's CI requirement, only this single unauthenticated
+      # configuration needs to be validated.
+      - name: docker compose up + hit all 4 required endpoints
+        run: ./scripts/contract-smoke-test.sh
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs || true

@@ -7,8 +7,12 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node scripts/run-unit-tests.js",
+    "test:contract": "bash scripts/contract-smoke-test.sh",
+    "test": "npm run typecheck && npm run test:unit",
     "benchmark": "node benchmark.js",
-    "test":"docker-compose down -v && docker-compose up --build -d && node benchmark.js"
+    "loadtest": "docker-compose down -v && docker-compose up --build -d && node benchmark.js"
   },
   "dependencies": {
     "fastify": "^4.26.0",
@@ -20,6 +24,7 @@
     "@types/pg": "^8.11.0",
     "@types/pg-copy-streams": "^1.2.5",
     "autocannon": "^7.14.0",
+    "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.3.3"
   }

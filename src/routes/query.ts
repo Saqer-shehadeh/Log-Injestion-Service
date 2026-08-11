@@ -86,12 +86,21 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
         // Anchor the cursor to the last row actually returned in this
         // page, not to any probe row the repository fetched internally —
         // see queryLogs()'s doc comment for why that distinction matters.
+        //
+        // Uses cursor_ts (Postgres-rendered, microsecond precision) rather
+        // than timestamp.toISOString() (JS Date, millisecond precision).
+        // The truncation the latter caused silently dropped rows at page
+        // boundaries — see LogRow.cursor_ts.
         const lastItem = rows[rows.length - 1];
-        const cursorVal = `${lastItem.timestamp.toISOString()}|${lastItem.id}`;
+        const cursorVal = `${lastItem.cursor_ts}|${lastItem.id}`;
         nextCursor = Buffer.from(cursorVal).toString('base64');
       }
 
-      return reply.status(200).send({ logs: rows, next_cursor: nextCursor });
+      // cursor_ts is an internal pagination detail — strip it so the response
+      // body keeps exactly the documented shape.
+      const logs = rows.map(({ cursor_ts, ...row }) => row);
+
+      return reply.status(200).send({ logs, next_cursor: nextCursor });
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }

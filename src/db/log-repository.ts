@@ -27,6 +27,19 @@ export interface LogRow {
   service: string;
   message: string;
   attributes: Record<string, unknown>;
+  /**
+   * Full-precision UTC ISO-8601 rendering of `timestamp`, produced by Postgres
+   * rather than by the driver. Used *only* to build the pagination cursor.
+   *
+   * `timestamp` above is a JS Date, which is millisecond-precision, but the
+   * column is TIMESTAMPTZ, which is microsecond-precision. Anchoring a cursor
+   * to the Date therefore truncated it (…123456 -> …123), and since the next
+   * page asks for `(timestamp, id) < (cursor)`, every remaining row whose
+   * true timestamp was above the truncated value was silently skipped —
+   * pagination would return a short page and then stop early, reporting
+   * `next_cursor: null` as though it had reached the end.
+   */
+  cursor_ts: string;
 }
 
 export interface LogsQueryOptions {
@@ -90,8 +103,12 @@ export function buildLogsQuery(options: LogsQueryOptions): { sql: string; values
 
   // Fetch one extra row beyond `limit` so the caller can tell whether a
   // next page exists without a separate COUNT query.
+  // cursor_ts is rendered by Postgres at full microsecond precision so the
+  // pagination cursor never loses resolution the way a JS Date would — see
+  // LogRow.cursor_ts.
   const sql = `
-    SELECT id, timestamp, level, service, message, attributes
+    SELECT id, timestamp, level, service, message, attributes,
+           to_char(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts
     FROM logs
     ${whereClause}
     ORDER BY timestamp DESC, id DESC

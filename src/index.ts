@@ -21,11 +21,16 @@ pgPool.on('connect', (client: any) => {
   client.query('SET synchronous_commit = on');
 });
 
+pgPool.on('error', (err: Error) => {
+  console.error('Unexpected error on idle PostgreSQL client:', err);
+});
+
 // Buffer stores pre-serialized TSV strings (not objects)
 const logBuffer = new RingBuffer<string>(500_000);
 
-// Adaptive worker: base batch 4000, flush interval 50ms, 1 concurrent flush for zero data loss
-const worker = new LogWorker(logBuffer, pgPool, 4000, 50, 1);
+// Adaptive worker: base batch 4000, flush interval 50ms. Concurrency is
+// fixed at 1 inside LogWorker (see its maxConcurrent comment).
+const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
 const fastify = Fastify({ logger: false });
 
 // Graceful shutdown: registered once, up front, so SIGTERM/SIGINT are

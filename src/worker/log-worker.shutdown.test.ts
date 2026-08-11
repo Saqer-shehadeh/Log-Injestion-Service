@@ -63,7 +63,7 @@ test('LogWorker.shutdown()', async (t) => {
     for (let i = 0; i < 5; i++) buffer.push(`row${i}\n`);
 
     const pool = new FakePool(() => new FakeCopyStream());
-    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50, 1);
+    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50);
 
     // shutdown() called directly, without start() — exercises the "drain
     // whatever's sitting in the buffer" path in isolation.
@@ -82,7 +82,7 @@ test('LogWorker.shutdown()', async (t) => {
       attempt++;
       return new FakeCopyStream({ shouldFail: attempt === 1 }); // fail once, then succeed
     });
-    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50, 1);
+    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50);
 
     assert.strictEqual(buffer.size(), 3);
     await worker.shutdown();
@@ -100,7 +100,7 @@ test('LogWorker.shutdown()', async (t) => {
       calls++;
       return new FakeCopyStream({ delayMs: 40 }); // simulate a slow COPY
     });
-    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50, 1);
+    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50);
 
     // start() synchronously fires the first flush cycle, which peeks the
     // batch and increments inFlight before this call returns.
@@ -121,7 +121,7 @@ test('LogWorker.shutdown()', async (t) => {
   await t.test('shutdown() on an already-idle worker (empty buffer) resolves immediately without any COPY', async () => {
     const buffer = new RingBuffer<string>(100);
     const pool = new FakePool(() => new FakeCopyStream());
-    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50, 1);
+    const worker = new LogWorker(buffer, pool as unknown as Pool, 4000, 50);
 
     await worker.shutdown();
 

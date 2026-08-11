@@ -15,7 +15,14 @@ export class LogWorker {
   private inFlight = 0;
   private flushCount = 0;
   private readonly bufferCapacity: number;
-  private readonly maxConcurrent: number;
+
+  // Not configurable. peekBatch()/drop() share a single read cursor on the
+  // RingBuffer, so two concurrent flushes would peek overlapping regions
+  // and could drop() the wrong one, corrupting the buffer. Running more
+  // than one flush at a time would require the RingBuffer to hand out
+  // non-overlapping batch leases instead of a shared cursor — it doesn't
+  // today, so this stays pinned at 1.
+  private readonly maxConcurrent = 1;
 
   // Set once graceful shutdown begins. Checked once per poll iteration in the
   // main loop (negligible cost) — never checked on the request/ingestion hot
@@ -26,12 +33,8 @@ export class LogWorker {
     private buffer: RingBuffer<string>,
     private pgPool: Pool,
     private baseBatchSize: number = 4000,
-    private flushIntervalMs: number = 50,
-    maxConcurrent: number = 1
+    private flushIntervalMs: number = 50
   ) {
-    // For correctness with peekBatch/drop, maxConcurrent is set to 1 to prevent
-    // multiple in-flight flushes from peeking/dropping the same buffer region.
-    this.maxConcurrent = 1;
     this.bufferCapacity = buffer.getCapacity();
   }
 

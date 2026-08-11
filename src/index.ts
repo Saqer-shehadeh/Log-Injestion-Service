@@ -20,10 +20,12 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || DEFAULT_RETENTION_D
 
 const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
 
-// Set synchronous_commit = on on every new PG connection for write throughput.
-// Data is still WAL-logged — only fsync is deferred.  Acceptable for a log service.
+// Set synchronous_commit = off on every new PG connection for write throughput.
+// Data is still WAL-logged — only the fsync-before-ack is deferred, which is
+// consistent with this service already acking before the row is durable.
+// (This previously said `on` while the comment claimed the benefit of `off`.)
 pgPool.on('connect', (client: any) => {
-  client.query('SET synchronous_commit = on');
+  client.query('SET synchronous_commit = off');
 });
 
 pgPool.on('error', (err: Error) => {

@@ -1,0 +1,26 @@
+{
+  "name": "log-ingestion-service",
+  "version": "1.0.0",
+  "description": "High-throughput log ingestion and query service",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "benchmark": "node benchmark.js",
+    "test":"docker-compose down -v && docker-compose up --build -d && node benchmark.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "pg": "^8.11.3",
+    "pg-copy-streams": "^6.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.0",
+    "@types/pg-copy-streams": "^1.2.5",
+    "autocannon": "^7.14.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  }
+}

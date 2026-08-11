@@ -24,6 +24,11 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # Docker defaults /dev/shm to 64MB, which Postgres uses for parallel worker
+    # shared memory. Observed failing in practice with
+    #   "could not resize shared memory segment ... No space left on device"
+    # during VACUUM on a large partition.
+    shm_size: 256mb
     # All Postgres tuning lives here, in one visible place. (It used to be
     # duplicated in an ALTER SYSTEM block in src/db/migrate.ts that silently
     # failed on every boot — see that file.)

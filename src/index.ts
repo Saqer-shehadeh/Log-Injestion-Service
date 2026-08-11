@@ -6,12 +6,17 @@ import { healthRoutes } from './routes/health';
 import { ingestionRoutes } from './routes/ingestion';
 import { queryRoutes } from './routes/query';
 import { aggregateRoutes } from './routes/aggregate';
-import { startRetentionTask } from './retention/retention-cron';
+import { DEFAULT_RETENTION_DAYS, startPartitionMaintenance } from './retention/retention-cron';
 import { initDb } from './db/migrate';
 import { createGracefulShutdown } from './shutdown/graceful-shutdown';
 
 const PORT = Number(process.env.PORT) || 8080;
 const DB_URL = process.env.DATABASE_URL || 'postgres://loguser:logpass@localhost:5432/logdb';
+
+// Configurable retention policy (spec: "~1,000,000 rows ≈ one month of
+// data"). Optional — the service is fully functional with zero config,
+// this just lets an operator override the window.
+const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || DEFAULT_RETENTION_DAYS;
 
 const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
 
@@ -33,12 +38,17 @@ const logBuffer = new RingBuffer<string>(500_000);
 const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
 const fastify = Fastify({ logger: false });
 
+// Set once main() starts the partition-maintenance job (see below). Held
+// here so the signal handlers can stop its timer on shutdown, even though
+// they're registered before the job exists.
+let partitionMaintenance: { stop: () => void } | null = null;
+
 // Graceful shutdown: registered once, up front, so SIGTERM/SIGINT are
 // handled even if they arrive during the startup DB-connect retry loop.
 // Both signals are wired to the same idempotent shutdown function.
 const shutdown = createGracefulShutdown({ fastify, worker, pgPool });
-process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
-process.on('SIGINT', () => { void shutdown('SIGINT'); });
+process.on('SIGTERM', () => { partitionMaintenance?.stop(); void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { partitionMaintenance?.stop(); void shutdown('SIGINT'); });
 
 async function main() {
   try {
@@ -59,7 +69,7 @@ async function main() {
     await fastify.register(aggregateRoutes(pgPool));
 
     worker.start();
-    startRetentionTask(pgPool, 7);
+    partitionMaintenance = startPartitionMaintenance(pgPool, { retentionDays: RETENTION_DAYS });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     console.log(`Server running on http://0.0.0.0:${PORT}`);

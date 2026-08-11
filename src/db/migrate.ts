@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
+import { DEFAULT_PARTITION_AHEAD_DAYS, ensureUpcomingPartitions } from './partitions';
 
-export async function initDb(pgPool: Pool) {
+export async function initDb(pgPool: Pool, options: { partitionAheadDays?: number } = {}) {
   // Apply DB-level performance settings
   try {
     await pgPool.query(`
@@ -30,5 +31,13 @@ export async function initDb(pgPool: Pool) {
     CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp DESC);
   `;
   await pgPool.query(query);
+
+  // Daily range partitions: ensure "today" and the next few days already
+  // exist before the server starts accepting ingestion traffic, so writes
+  // never land in the DEFAULT partition under normal operation. This is
+  // awaited here (not left to the periodic maintenance job) specifically
+  // so it completes before main() registers routes / starts the worker.
+  await ensureUpcomingPartitions(pgPool, options.partitionAheadDays ?? DEFAULT_PARTITION_AHEAD_DAYS);
+
   console.log('Database migrations applied successfully.');
 }

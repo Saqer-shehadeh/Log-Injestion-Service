@@ -7,7 +7,7 @@ async function benchmarkQuery() {
         const start = performance.now();
 
         try {
-
+            
             await fetch(
                 "http://localhost:8080/logs/aggregate?since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&bucket=1m"
             );

@@ -23,11 +23,8 @@ pgPool.on('connect', (client: any) => {
 // Buffer stores pre-serialized TSV strings (not objects)
 const logBuffer = new RingBuffer<string>(500_000);
 
-// Adaptive worker: base batch 2000, flush interval 200ms, up to 3 concurrent flushes
-const worker = new LogWorker(logBuffer, pgPool, 4000, 50, 3)
-// const worker = new LogWorker(logBuffer, pgPool, 4000, 50, 3); هووون الاصل الشغال
-
-// const worker = new LogWorker(logBuffer, pgPool, 2000, 200, 3);
+// Adaptive worker: base batch 4000, flush interval 50ms, 1 concurrent flush for zero data loss
+const worker = new LogWorker(logBuffer, pgPool, 4000, 50, 1);
 const fastify = Fastify({ logger: false });
 
 async function main() {

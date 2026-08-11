@@ -22,9 +22,11 @@ export class LogWorker {
     private pgPool: Pool,
     private baseBatchSize: number = 4000,
     private flushIntervalMs: number = 50,
-    maxConcurrent: number = 2
+    maxConcurrent: number = 1
   ) {
-    this.maxConcurrent = maxConcurrent;
+    // For correctness with peekBatch/drop, maxConcurrent is set to 1 to prevent
+    // multiple in-flight flushes from peeking/dropping the same buffer region.
+    this.maxConcurrent = 1;
     this.bufferCapacity = buffer.getCapacity();
   }
 
@@ -68,7 +70,9 @@ export class LogWorker {
 
 
   private fireFlush(batchSize: number): void {
-    const batch = this.buffer.popBatch(batchSize);
+    // Correctness Invariant: Use peekBatch to inspect items without removing them.
+    // Items remain in the RingBuffer until PostgreSQL COPY succeeds.
+    const batch = this.buffer.peekBatch(batchSize);
     if (batch.length === 0) return;
 
     this.inFlight++;
@@ -103,6 +107,9 @@ export class LogWorker {
         stream.end();
       });
 
+      // Correctness Invariant: Drop items from RingBuffer ONLY after successful COPY
+      this.buffer.drop(batch.length);
+
       if (++this.flushCount % 10 === 0) {
         console.log({
           batchSize: batch.length,
@@ -112,6 +119,10 @@ export class LogWorker {
         });
       }
 
+    } catch (err) {
+      console.error('Flush pipeline error (batch retained in buffer for retry):', err);
+      // Wait briefly on failure before retrying to prevent aggressive spinning during DB outages
+      await this.sleep(100);
     } finally {
       if (client) client.release();
     }

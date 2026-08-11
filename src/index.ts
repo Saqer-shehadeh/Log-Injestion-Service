@@ -8,6 +8,7 @@ import { queryRoutes } from './routes/query';
 import { aggregateRoutes } from './routes/aggregate';
 import { startRetentionTask } from './retention/retention-cron';
 import { initDb } from './db/migrate';
+import { createGracefulShutdown } from './shutdown/graceful-shutdown';
 
 const PORT = Number(process.env.PORT) || 8080;
 const DB_URL = process.env.DATABASE_URL || 'postgres://loguser:logpass@localhost:5432/logdb';
@@ -26,6 +27,13 @@ const logBuffer = new RingBuffer<string>(500_000);
 // Adaptive worker: base batch 4000, flush interval 50ms, 1 concurrent flush for zero data loss
 const worker = new LogWorker(logBuffer, pgPool, 4000, 50, 1);
 const fastify = Fastify({ logger: false });
+
+// Graceful shutdown: registered once, up front, so SIGTERM/SIGINT are
+// handled even if they arrive during the startup DB-connect retry loop.
+// Both signals are wired to the same idempotent shutdown function.
+const shutdown = createGracefulShutdown({ fastify, worker, pgPool });
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
 
 async function main() {
   try {

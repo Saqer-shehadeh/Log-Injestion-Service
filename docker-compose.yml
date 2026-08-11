@@ -3,6 +3,10 @@ version: '3.8'
 services:
   app:
     build: .
+    # The app aborts the process on an unrecoverable V8 heap error. Without a
+    # restart policy that abort is terminal for the rest of the run: the
+    # container stays dead and every subsequent request is connection-refused.
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:

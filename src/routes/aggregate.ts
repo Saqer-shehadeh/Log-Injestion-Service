@@ -1,8 +1,16 @@
 import { FastifyPluginAsync } from 'fastify';
 import { Pool } from 'pg';
 import { isValidAttributeKey } from '../validation/log-validator';
+import { AttrFilter, aggregateLogs } from '../db/log-repository';
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
+
+const BUCKET_INTERVALS: Record<string, string> = {
+  '1m': '1 minute',
+  '5m': '5 minutes',
+  '1h': '1 hour',
+  '1d': '1 day',
+};
 
 export const aggregateRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify) => {
   fastify.get('/logs/aggregate', async (request, reply) => {
@@ -30,79 +38,48 @@ export const aggregateRoutes = (pgPool: Pool): FastifyPluginAsync => async (fast
       return reply.status(400).send({ error: `Invalid level: '${q.level}'` });
     }
 
-    const bucketMap: Record<string, string> = {
-      '1m': '1 minute',
-      '5m': '5 minutes',
-      '1h': '1 hour',
-      '1d': '1 day'
-    };
-
-    const interval = bucketMap[q.bucket];
-    if (!interval) {
+    const bucketInterval = BUCKET_INTERVALS[q.bucket];
+    if (!bucketInterval) {
       return reply.status(400).send({ error: 'Invalid bucket size. Supported: 1m, 5m, 1h, 1d' });
     }
 
-    // --- Build filters ---
+    // --- Filters (spec: same filters as GET /logs) ---
 
-    const conditions: string[] = [
-      `timestamp >= $1`,
-      `timestamp < $2`
-    ];
-    const values: any[] = [q.since, q.until];
-    let paramIdx = 3;
-
-    if (q.service) {
-      conditions.push(`service = $${paramIdx++}`);
-      values.push(q.service);
-    }
-
-    if (q.level) {
-      conditions.push(`level = $${paramIdx++}`);
-      values.push(q.level);
-    }
-
-    // attr.<key> filters (spec: same filters as GET /logs)
+    const attrFilters: AttrFilter[] = [];
     for (const key of Object.keys(q)) {
       if (key.startsWith('attr.')) {
         const attrKey = key.slice(5);
         if (!isValidAttributeKey(attrKey)) {
           return reply.status(400).send({ error: `Invalid attribute key format: '${attrKey}'` });
         }
-        conditions.push(`attributes->>'${attrKey}' = $${paramIdx++}`);
-        values.push(q[key]);
+        attrFilters.push({ key: attrKey, value: q[key] });
       }
-    }
-
-    // Message search filter (spec: same filters as GET /logs)
-    if (q.q) {
-      conditions.push(`message ILIKE $${paramIdx++}`);
-      values.push(`%${q.q}%`);
     }
 
     // --- Group by ---
 
-    const groupByField = q.group_by;
-    if (groupByField && groupByField !== 'service' && groupByField !== 'level') {
-      return reply.status(400).send({ error: 'group_by must be either "service" or "level"' });
+    let groupBy: 'service' | 'level' | undefined;
+    if (q.group_by) {
+      if (q.group_by !== 'service' && q.group_by !== 'level') {
+        return reply.status(400).send({ error: 'group_by must be either "service" or "level"' });
+      }
+      groupBy = q.group_by;
     }
 
-    const groupSelect = groupByField ? `, ${groupByField} AS "group"` : ', NULL AS "group"';
-    const groupByClause = groupByField ? `, ${groupByField}` : '';
-
-    const query = `
-      SELECT 
-        date_bin('${interval}'::interval, timestamp, TIMESTAMP '2026-01-01') AS start
-        ${groupSelect},
-        COUNT(*)::int as count
-      FROM logs
-      WHERE ${conditions.join(' AND ')}
-      GROUP BY start ${groupByClause}
-      ORDER BY start ASC
-    `;
+    // --- Query + persistence (delegated to db/log-repository.ts) ---
 
     try {
-      const res = await pgPool.query(query, values);
-      return reply.status(200).send({ buckets: res.rows });
+      const buckets = await aggregateLogs(pgPool, {
+        since: q.since,
+        until: q.until,
+        bucketInterval,
+        service: q.service || undefined,
+        level: q.level || undefined,
+        q: q.q || undefined,
+        attrFilters,
+        groupBy,
+      });
+      return reply.status(200).send({ buckets });
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }

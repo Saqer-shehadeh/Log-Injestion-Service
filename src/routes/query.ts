@@ -1,8 +1,11 @@
 import { FastifyPluginAsync } from 'fastify';
 import { Pool } from 'pg';
 import { isValidAttributeKey } from '../validation/log-validator';
+import { AttrFilter, queryLogs } from '../db/log-repository';
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 1000;
 
 export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify) => {
   fastify.get('/logs', async (request, reply) => {
@@ -10,11 +13,11 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
 
     // --- Parameter validation (spec compliance) ---
 
-    let limit = 50;
+    let limit = DEFAULT_LIMIT;
     if (q.limit !== undefined) {
       limit = parseInt(q.limit, 10);
-      if (isNaN(limit) || limit < 1 || limit > 1000) {
-        return reply.status(400).send({ error: 'Limit must be a number between 1 and 1000' });
+      if (isNaN(limit) || limit < 1 || limit > MAX_LIMIT) {
+        return reply.status(400).send({ error: `Limit must be a number between 1 and ${MAX_LIMIT}` });
       }
     }
 
@@ -34,48 +37,18 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
       return reply.status(400).send({ error: 'until must not be earlier than since' });
     }
 
-    // --- Build query ---
-
-    const conditions: string[] = [];
-    const values: any[] = [];
-    let paramIdx = 1;
-
-    if (q.service) {
-      conditions.push(`service = $${paramIdx++}`);
-      values.push(q.service);
-    }
-
-    if (q.level) {
-      conditions.push(`level = $${paramIdx++}`);
-      values.push(q.level);
-    }
-
-    if (q.since) {
-      conditions.push(`timestamp >= $${paramIdx++}`);
-      values.push(q.since);
-    }
-
-    if (q.until) {
-      conditions.push(`timestamp < $${paramIdx++}`);
-      values.push(q.until);
-    }
-
-    if (q.q) {
-      conditions.push(`message ILIKE $${paramIdx++}`);
-      values.push(`%${q.q}%`);
-    }
-
+    const attrFilters: AttrFilter[] = [];
     for (const key of Object.keys(q)) {
       if (key.startsWith('attr.')) {
         const attrKey = key.slice(5);
         if (!isValidAttributeKey(attrKey)) {
           return reply.status(400).send({ error: `Invalid attribute key format: '${attrKey}'` });
         }
-        conditions.push(`attributes->>'${attrKey}' = $${paramIdx++}`);
-        values.push(q[key]);
+        attrFilters.push({ key: attrKey, value: q[key] });
       }
     }
 
+    let cursor: { timestamp: string; id: string } | undefined;
     if (q.cursor) {
       try {
         const decoded = Buffer.from(q.cursor, 'base64').toString('utf-8');
@@ -88,31 +61,32 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
         if (isNaN(Date.parse(cTimestamp)) || isNaN(Number(cId))) {
           return reply.status(400).send({ error: 'Invalid cursor format' });
         }
-        conditions.push(`(timestamp, id) < ($${paramIdx++}, $${paramIdx++})`);
-        values.push(cTimestamp, cId);
+        cursor = { timestamp: cTimestamp, id: cId };
       } catch (err) {
         return reply.status(400).send({ error: 'Invalid cursor format' });
       }
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    
-    const query = `
-      SELECT id, timestamp, level, service, message, attributes
-      FROM logs
-      ${whereClause}
-      ORDER BY timestamp DESC, id DESC
-      LIMIT $${paramIdx}
-    `;
-    values.push(limit + 1);
+    // --- Query + persistence (delegated to db/log-repository.ts) ---
 
     try {
-      const res = await pgPool.query(query, values);
-      const rows = res.rows;
-      let nextCursor: string | null = null;
+      const { rows, hasMore } = await queryLogs(pgPool, {
+        service: q.service || undefined,
+        level: q.level || undefined,
+        since: q.since || undefined,
+        until: q.until || undefined,
+        q: q.q || undefined,
+        attrFilters,
+        cursor,
+        limit,
+      });
 
-      if (rows.length > limit) {
-        const lastItem = rows.pop();
+      let nextCursor: string | null = null;
+      if (hasMore) {
+        // Anchor the cursor to the last row actually returned in this
+        // page, not to any probe row the repository fetched internally —
+        // see queryLogs()'s doc comment for why that distinction matters.
+        const lastItem = rows[rows.length - 1];
         const cursorVal = `${lastItem.timestamp.toISOString()}|${lastItem.id}`;
         nextCursor = Buffer.from(cursorVal).toString('base64');
       }

@@ -62,7 +62,7 @@ test('HTTP Endpoint Integration Tests - attr.<key> SQL Injection Prevention', as
     });
     assert.strictEqual(res.statusCode, 200);
     assert.ok(executedSql.includes("attributes->>'userId' = $1"));
-    assert.deepStrictEqual(executedValues, ['usr_123', 51]);
+    assert.deepStrictEqual(executedValues, ['usr_123', 101]); // default limit is 100, +1 probe row
   });
 
   await t.test('GET /logs - valid attr.user_id returns 200', async () => {

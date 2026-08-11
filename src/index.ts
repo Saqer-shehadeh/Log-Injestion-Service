@@ -38,6 +38,19 @@ const logBuffer = new RingBuffer<string>(500_000);
 const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
 const fastify = Fastify({ logger: false });
 
+// Normalizes every error response to the API's {"error": "<description>"}
+// convention (used throughout query.ts/aggregate.ts's own 400s). Without
+// this, errors Fastify raises itself before a handler runs — e.g.
+// malformed JSON bodies on POST /logs — fall through to Fastify's default
+// shape ({statusCode, error: "Bad Request", message}), which is
+// inconsistent with the rest of the API. Handlers that already call
+// reply.status(...).send(...) directly are unaffected; this only catches
+// thrown/rejected errors.
+fastify.setErrorHandler((error, _request, reply) => {
+  const statusCode = error.statusCode ?? 500;
+  reply.status(statusCode).send({ error: error.message });
+});
+
 // Set once main() starts the partition-maintenance job (see below). Held
 // here so the signal handlers can stop its timer on shutdown, even though
 // they're registered before the job exists.

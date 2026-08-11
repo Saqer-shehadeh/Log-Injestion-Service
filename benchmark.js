@@ -113,7 +113,7 @@ async function runBenchmark() {
   );
 
   console.log(
-    `Latency p95        : ${result.latency.p95 ?? 'N/A'} ms`
+    `Latency p97.5      : ${result.latency.p97_5 ?? 'N/A'} ms`
   );
 
   console.log(

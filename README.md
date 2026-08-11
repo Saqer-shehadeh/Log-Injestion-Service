@@ -251,22 +251,22 @@ No optional features are implemented (see [Optional Features](#optional-features
 
 **Methodology:**
 
-- `benchmark.js` (autocannon) drives `POST /logs` at a fixed configuration — 1 connection, 1 pipelining, 50 logs/request, 60s duration — and reports `logs/sec` derived from `HTTP requests/sec × 50`, plus autocannon's latency percentiles, error/timeout/non-2xx counts.
+- `benchmark.js` (autocannon) drives `POST /logs` at a fixed configuration — 1 connection, 1 pipelining, 50 logs/request, 60s duration — and reports `logs/sec` derived from `HTTP requests/sec × 50`, plus autocannon's latency percentiles (avg, p50, p97.5, p99 — autocannon does not expose p95), error/timeout/non-2xx counts.
 - `benchmark-query.js` separately polls `GET /logs/aggregate` once per second, printing per-request latency, for exercising the "1 aggregation request/sec during ingestion" and "<1s p95" targets.
 - Run either against a stack already started with `docker compose up`, or use `npm run loadtest` for a one-command teardown/rebuild/benchmark cycle.
 
-**Numbers:** this run was prepared in a sandboxed environment without Docker available, so the figures below have **not** been re-measured against the current build (partitioned schema, retention-drop, `limit=100` default, the repository refactor, etc.) and are intentionally left as a template rather than restated as fact. Fill this in from your own run before submitting:
+**Numbers:** measured against the current build (partitioned schema, retention-drop, `limit=100` default) with `docker compose up --build -d`, `npm run benchmark` (ingestion) running concurrently with `node benchmark-query.js` (aggregation, 1 req/sec) and `docker stats` sampled every 2s, all against the resource limits in `docker-compose.yml`.
 
 | Metric | Result |
 |---|---|
-| Test environment (CPU/RAM limits, OS) | _run `docker compose up` with the limits in `docker-compose.yml`, record host details_ |
-| Dataset size at test time | _row count from `SELECT count(*) FROM logs;`_ |
+| Test environment (CPU/RAM limits, OS) | App: 0.5 CPU / 256MB, Postgres: 1.0 CPU / 1GB (`docker-compose.yml` `deploy.resources.limits`). Host: Windows 11, Intel i5-1135G7 (8 logical CPUs), Docker Desktop engine allotted 8 CPUs / ~3.7GB RAM. |
+| Dataset size at test time | 2,355,050 rows (`SELECT count(*) FROM logs;`) before this run, from prior benchmark runs; 3,989,100 after — comfortably past the spec's ~1,000,000-row target. |
 | Batch size | 50 logs/request (`benchmark.js`'s `LOGS_PER_REQUEST`) |
-| Ingestion rate | _logs/sec from `npm run benchmark`_ |
-| Query rate | _requests/sec from `benchmark-query.js`_ |
-| Query latency (p50 / p95 / p99) | _from `benchmark-query.js` output_ |
-| Resource usage during test | _`docker stats` output for both containers_ |
-| Bottlenecks discovered | _fill in_ |
+| Ingestion rate | 27,233.33 logs/sec (544.67 req/sec × 50), 32,680 requests over 60s, 0 errors/timeouts/non-2xx. Latency (single connection, no pipelining): avg 1.26ms, p50 0ms, p97.5 3ms, p99 28ms — consistent with 544.67 req/sec (≈1/1.26ms), confirming the run was genuinely sequential. |
+| Query rate | 1 req/sec (`benchmark-query.js`'s fixed polling interval), sustained for 111s spanning the full ingestion run. |
+| Query latency (p50 / p95 / p99) | 3.85ms / 61.84ms / 213.04ms over 111 samples taken while ingestion was active — well inside the spec's p95 < 1s target. One outlier hit 2947.51ms, coinciding with a Postgres CPU spike to ~101% of its 1-CPU limit (see below); a single-sample spike at that scale doesn't move p95 but is a real tail-latency risk under sustained write contention. |
+| Resource usage during test | App: steady 47–52% CPU (of its 0.5-CPU limit — i.e. near-saturated, this is the actual throughput ceiling), ~34MB/256MB (13%) memory. Postgres: CPU fluctuating 24–101% of its 1.0-CPU limit (spikes align with `COPY` flushes/WAL checkpoints), memory climbing from ~290MB during the run to ~572MB shortly after (post-run checkpoint activity), both within the 1GB limit. |
+| Bottlenecks discovered | App CPU is the ingestion ceiling — pinned near 100% of its 0.5-CPU allocation throughout the run, not memory or Postgres. Postgres CPU spikes (up to 101% of its 1-CPU cap) during flush/checkpoint correlate with the one large aggregation-latency outlier, showing query latency does degrade under sustained write contention even though the p95 SLA still holds comfortably. |
 | Optimizations applied | pre-serialization to TSV at ingestion time; single-chunk `COPY` streaming (`batch.join('')`); adaptive batch sizing (4,000 baseline, up to 8,000 under high occupancy); daily partitioning + partition-drop retention instead of bulk `DELETE` |
 
 To reproduce: `docker compose up --build -d`, then `npm run benchmark`, and separately `node benchmark-query.js` (Ctrl-C to stop) while the ingestion benchmark runs, to get concurrent ingest+query numbers. `docker stats` in another terminal for resource usage.

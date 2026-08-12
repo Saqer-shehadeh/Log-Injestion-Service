@@ -19,7 +19,7 @@ const COPY_ESCAPE_MAP: Record<string, string> = {
   '\r': '\\r',
 };
 
-const MS_PER_MINUTE = 60_000;
+const MS_PER_SECOND = 1_000;
 
 /**
  * The overwhelming majority of log fields contain no tab, newline, or
@@ -87,12 +87,12 @@ export const ingestionRoutes =
             (hasAttrs ? escapeCopyValue(JSON.stringify(attrs)) : '{}') + '\n'
         );
 
-        // Accumulate this entry into its (minute, service, level) counter. The
+        // Accumulate this entry into its (second, service, level) counter. The
         // pipeline merges these per-request maps into one per-transaction map,
         // so the rollup upsert stays a single small statement no matter how
         // many rows the batch carries.
         const bucketMs =
-          Math.floor((result.timestampMs as number) / MS_PER_MINUTE) * MS_PER_MINUTE;
+          Math.floor((result.timestampMs as number) / MS_PER_SECOND) * MS_PER_SECOND;
         const key = `${bucketMs}|${result.log.service}|${result.log.level}`;
         const existing = rollup.get(key);
         if (existing) {

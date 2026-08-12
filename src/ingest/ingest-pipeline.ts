@@ -56,9 +56,9 @@ export class IngestUnavailableError extends Error {
   }
 }
 
-/** One (minute, service, level) counter contribution from a single request. */
+/** One (second, service, level) counter contribution from a single request. */
 export interface RollupDelta {
-  /** Epoch ms, truncated to the start of its UTC minute. */
+  /** Epoch ms, truncated to the start of its UTC second. */
   bucketMs: number;
   service: string;
   level: string;
@@ -112,10 +112,10 @@ const COPY_SQL =
 // rolled-back attempt cannot double-count: the failed attempt committed
 // nothing, so the delta is applied exactly once.
 const ROLLUP_UPSERT_SQL = `
-  INSERT INTO log_rollup_1m (bucket_start, service, level, count)
+  INSERT INTO log_rollup_1s (bucket_start, service, level, count)
   SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::bigint[])
   ON CONFLICT (bucket_start, service, level)
-  DO UPDATE SET count = log_rollup_1m.count + EXCLUDED.count
+  DO UPDATE SET count = log_rollup_1s.count + EXCLUDED.count
 `;
 
 export class IngestPipeline {
@@ -277,7 +277,7 @@ export class IngestPipeline {
 
   /**
    * One attempt: COPY the rows and apply the rollup counters in a single
-   * transaction. Either both land or neither does, so log_rollup_1m can never
+   * transaction. Either both land or neither does, so log_rollup_1s can never
    * drift from `logs`. A failed attempt rolls back cleanly, which is what
    * makes the retry above safe to run without duplicating rows.
    */

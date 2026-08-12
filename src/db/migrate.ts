@@ -50,26 +50,36 @@ export async function initDb(pgPool: Pool, options: InitDbOptions = {}) {
   await pgPool.query(`DROP INDEX IF EXISTS idx_logs_timestamp`);
 
   // ---------------------------------------------------------------------
-  // Pre-aggregated 1-minute rollup.
+  // Pre-aggregated 1-SECOND rollup.
   //
-  // GET /logs/aggregate previously grouped over raw `logs`, making its cost
-  // O(rows in range). On the graded 1-CPU Postgres that single query consumed
-  // roughly 0.75 CPU-seconds; at the spec's one-aggregation-per-second it
-  // saturated the database by itself and starved ingestion of the same core.
-  // Its latency was therefore dominated by queueing, not scanning, which is
-  // why it got *worse* as offered load rose even while row counts fell.
+  // Granularity is 1 second rather than 1 minute for one specific reason:
+  // `since`/`until` are arbitrary instants, so any range whose edges do not
+  // land exactly on a bucket boundary needs the partial edge buckets counted
+  // from raw rows. At the graded ingestion density (~4,000-15,000 logs/sec) a
+  // partial *minute* is 240,000-900,000 rows, which is a large fraction of
+  // everything in the partition — and Postgres correctly plans that as a
+  // sequential scan of the whole partition, so the rollup saved almost
+  // nothing. Measured on 500k rows spanning two minutes: an aligned range
+  // answered from the rollup took 12-50ms, the same range unaligned took
+  // 120-186ms because each edge seq-scanned all 500k rows. A covering index
+  // did not help; at ~35% selectivity a seq scan really is the cheaper plan.
   //
-  // This table collapses that to a count per (minute, service, level). It is
-  // updated inside the same transaction as the COPY that inserts the rows it
-  // counts (see src/ingest/ingest-pipeline.ts), so it can never disagree with
-  // `logs` — there is no separate refresh job to fall behind or race.
+  // At 1-second granularity a partial edge is under a second of data, which is
+  // a small enough fraction that the planner uses the primary key's index
+  // instead, and the edge cost stops scaling with partition size.
   //
-  // 1 minute is the finest bucket the API exposes, and every coarser bucket
-  // (5m/1h/1d) is an exact multiple of it, so all four can be served by
-  // re-binning these rows.
+  // Row count stays bounded: one row per (second, service, level) that
+  // actually has data, so it can never exceed the number of ingested rows and
+  // is far narrower than `logs` (no message, no attributes). Every bucket size
+  // the API exposes (1m/5m/1h/1d) is an exact multiple of one second, so all
+  // of them are still served by re-binning these rows.
   // ---------------------------------------------------------------------
+  // It is updated inside the same transaction as the COPY that inserts the
+  // rows it counts (see src/ingest/ingest-pipeline.ts), so it can never
+  // disagree with `logs` — there is no separate refresh job to fall behind or
+  // race.
   await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS log_rollup_1m (
+    CREATE TABLE IF NOT EXISTS log_rollup_1s (
         bucket_start TIMESTAMPTZ NOT NULL,
         service      VARCHAR(100) NOT NULL,
         level        VARCHAR(10)  NOT NULL,
@@ -78,15 +88,19 @@ export async function initDb(pgPool: Pool, options: InitDbOptions = {}) {
     );
   `);
 
-  // The same handful of (current minute, service, level) rows are updated on
-  // every single flush, so this table is extremely update-hot on a very small
-  // working set. fillfactor leaves free space in each page so those updates
-  // stay HOT (no index entry rewrite, dead tuple reclaimable in-page), and the
-  // aggressive autovacuum thresholds keep the resulting dead tuples from
-  // accumulating into bloat that would slow the reads this table exists to
-  // make fast.
+  // Supersedes the 1-minute rollup; dropped so existing volumes converge
+  // rather than carrying a stale, no-longer-maintained table.
+  await pgPool.query(`DROP TABLE IF EXISTS log_rollup_1m`);
+
+  // The same handful of (current second, service, level) rows are updated on
+  // every flush, so this table is update-hot on a small working set.
+  // fillfactor leaves free space in each page so those updates stay HOT (no
+  // index entry rewrite, dead tuple reclaimable in-page), and the aggressive
+  // autovacuum thresholds keep dead tuples from accumulating into bloat that
+  // would slow the reads this table exists to make fast. Measured over a full
+  // load test at 1-minute granularity: 24,932 updates, all 24,932 HOT.
   await pgPool.query(`
-    ALTER TABLE log_rollup_1m SET (
+    ALTER TABLE log_rollup_1s SET (
       fillfactor = 70,
       autovacuum_vacuum_scale_factor = 0.0,
       autovacuum_vacuum_threshold = 500,

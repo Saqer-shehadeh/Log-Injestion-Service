@@ -216,12 +216,12 @@ export function buildAggregateQuery(options: AggregateOptions): { sql: string; v
  */
 const BUCKET_ORIGIN = `TIMESTAMPTZ '2026-01-01 00:00:00+00'`;
 
-const MS_PER_MINUTE = 60_000;
+const MS_PER_SECOND = 1_000;
 
 /**
- * True when this request can be served from log_rollup_1m.
+ * True when this request can be served from log_rollup_1s.
  *
- * The rollup stores only (minute, service, level, count) — it has no message
+ * The rollup stores only (second, service, level, count) — it has no message
  * and no attributes — so `q` and `attr.<key>` filters cannot be answered from
  * it and must fall back to scanning raw rows. Everything else can.
  */
@@ -232,20 +232,27 @@ export function canUseRollup(options: AggregateOptions): boolean {
 /**
  * Builds the rollup-backed aggregation.
  *
- * `since`/`until` are arbitrary instants, but rollup rows are whole minutes,
+ * `since`/`until` are arbitrary instants, but rollup rows are whole seconds,
  * so reading the rollup alone would be wrong at the edges: a request starting
- * at 10:00:30 must not include 10:00:00-10:00:29, yet those rows live in the
- * same 10:00 bucket. Rather than restrict this path to minute-aligned
+ * at 10:00:00.300 must not include 10:00:00.000-10:00:00.299, yet those rows
+ * live in the same 10:00:00 bucket. Rather than restrict this path to aligned
  * requests, the query unions three exact pieces:
  *
- *   [since, firstWholeMinute)   raw rows   (empty when since is aligned)
- *   [firstWholeMinute, lastWholeMinute)    rollup rows
- *   [lastWholeMinute, until)    raw rows   (empty when until is aligned)
+ *   [since, firstWholeSecond)   raw rows   (empty when since is aligned)
+ *   [firstWholeSecond, lastWholeSecond)    rollup rows
+ *   [lastWholeSecond, until)    raw rows   (empty when until is aligned)
  *
- * The raw pieces span less than a minute each, so they stay cheap and
- * partition-pruned regardless of how much data the full range covers, while
- * the bulk of the range is answered from pre-aggregated counts. The result is
- * identical to scanning raw rows for any input.
+ * Granularity is deliberately one second, not one minute. The edge pieces are
+ * raw scans, and their cost is what the rollup cannot remove — so the bucket
+ * size sets a floor on how expensive an unaligned request can be. At the
+ * graded ingestion density a partial *minute* is hundreds of thousands of
+ * rows, a large enough fraction of the partition that Postgres correctly plans
+ * a sequential scan over all of it; measured, that made an unaligned request
+ * 10x the cost of an aligned one and left the database saturated. A partial
+ * *second* is a small enough fraction to be served from the primary key index,
+ * so the edge cost stops scaling with how much data the partition holds.
+ *
+ * The result is identical to scanning raw rows, for any input.
  */
 export function buildRollupAggregateQuery(options: AggregateOptions): { sql: string; values: unknown[] } {
   assertValidAttrFilters(options.attrFilters);
@@ -253,9 +260,9 @@ export function buildRollupAggregateQuery(options: AggregateOptions): { sql: str
   const sinceMs = Date.parse(options.since);
   const untilMs = Date.parse(options.until);
 
-  let rollupFromMs: number | null = Math.ceil(sinceMs / MS_PER_MINUTE) * MS_PER_MINUTE;
-  let rollupToMs: number | null = Math.floor(untilMs / MS_PER_MINUTE) * MS_PER_MINUTE;
-  // Range too narrow to contain a whole minute: answer entirely from raw rows.
+  let rollupFromMs: number | null = Math.ceil(sinceMs / MS_PER_SECOND) * MS_PER_SECOND;
+  let rollupToMs: number | null = Math.floor(untilMs / MS_PER_SECOND) * MS_PER_SECOND;
+  // Range too narrow to contain a whole second: answer entirely from raw rows.
   if (rollupFromMs >= rollupToMs) {
     rollupFromMs = null;
     rollupToMs = null;
@@ -290,7 +297,7 @@ export function buildRollupAggregateQuery(options: AggregateOptions): { sql: str
 
   if (rollupFromMs !== null && rollupToMs !== null) {
     branches.push(
-      `SELECT bucket_start AS ts, service, level, count AS c FROM log_rollup_1m
+      `SELECT bucket_start AS ts, service, level, count AS c FROM log_rollup_1s
         WHERE bucket_start >= ${bind(iso(rollupFromMs))} AND bucket_start < ${bind(iso(rollupToMs))}${filters()}`
     );
   }

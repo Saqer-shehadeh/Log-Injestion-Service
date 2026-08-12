@@ -105,7 +105,9 @@ Accepts a batch (a batch of one is valid):
 
 `400` when every entry is rejected, the body isn't valid JSON, or the top-level shape isn't `{ "logs": [...] }`. Every error response (including framework-level ones like malformed JSON) uses `{"error": "<description>"}`.
 
-Ingestion returns as soon as accepted entries are durably queued in the in-memory ring buffer — not after they've been `COPY`'d into Postgres. See [Known Limitations](#known-limitations) for what that trades off.
+Ingestion returns **only after the accepted entries have been committed to Postgres** — `accepted` means durably stored, never merely queued. Requests are grouped into batches, so response latency includes up to ~20ms of batching plus the commit; see [Architecture](#architecture) and [Known Limitations](#known-limitations).
+
+`503` with a `Retry-After` header is returned instead of `200` if the service cannot commit the batch, rather than acknowledging writes that did not happen.
 
 ### `GET /logs` — Query logs
 
@@ -172,11 +174,11 @@ One row per bucket/group combination, ordered by `start` ascending, `group: null
 ```
 POST /logs
   → validateLogEntry() (per-entry validation)
-  → serialize accepted entries to COPY-ready TSV + per-(minute,service,level) counters
+  → serialize accepted entries to COPY-ready TSV + per-(second,service,level) counters
   → IngestPipeline.submit()              ← request now WAITS here
   → [batched] BEGIN
                COPY logs FROM STDIN (pg-copy-streams)
-               INSERT INTO log_rollup_1m ... ON CONFLICT DO UPDATE (counter deltas)
+               INSERT INTO log_rollup_1s ... ON CONFLICT DO UPDATE (counter deltas)
               COMMIT
   → HTTP 200 returned                    ← only after the COMMIT above
   → row is committed and immediately visible to GET /logs and GET /logs/aggregate
@@ -221,10 +223,10 @@ Two indexes total, both on the partitioned parent so every partition (including 
 
 A third index, `idx_logs_timestamp (timestamp DESC)`, was **removed**: the primary key already covers every access path it served, so it was pure write amplification — a third index maintained on every `COPY`'d row on a database whose write path is the scarce resource. Measured on a populated partition, it was 17MB of index being maintained for no distinct query benefit.
 
-### Pre-aggregated rollup
+### Pre-aggregated rollup (1-second)
 
 ```sql
-CREATE TABLE log_rollup_1m (
+CREATE TABLE log_rollup_1s (
     bucket_start TIMESTAMPTZ NOT NULL,
     service      VARCHAR(100) NOT NULL,
     level        VARCHAR(10)  NOT NULL,

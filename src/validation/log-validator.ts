@@ -1,9 +1,26 @@
-import { ValidatedLog } from '../worker/log-worker';
+/**
+ * A log entry that has passed validation. This is the original parsed request
+ * object, narrowed — validation deliberately does not copy it, so there is one
+ * object per entry rather than two on the ingestion hot path.
+ */
+export interface ValidatedLog {
+  timestamp: string;
+  level: string;
+  service: string;
+  message: string;
+  attributes: Record<string, any>;
+}
 
 export interface ValidationResult {
   valid: boolean;
   log?: ValidatedLog;
   reason?: string;
+  /**
+   * The already-parsed timestamp, in epoch milliseconds. Returned so callers
+   * that need a numeric timestamp (the rollup bucket, for one) do not have to
+   * parse the same ISO string a second time on the ingestion hot path.
+   */
+  timestampMs?: number;
 }
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
@@ -62,6 +79,7 @@ export function validateLogEntry(entry: any, nowMs: number): ValidationResult {
   // Zero-copy: return reference to original parsed object
   return {
     valid: true,
-    log: entry as ValidatedLog
+    log: entry as ValidatedLog,
+    timestampMs: ts,
   };
 }

@@ -1,6 +1,10 @@
 import { FastifyPluginAsync } from 'fastify';
-import { RingBuffer } from '../buffer/ring-buffer';
 import { validateLogEntry } from '../validation/log-validator';
+import {
+  BackpressureError,
+  IngestPipeline,
+  RollupDelta,
+} from '../ingest/ingest-pipeline';
 
 // Single-pass regex for COPY escape — 1 scan instead of 4
 const COPY_ESCAPE_RE = /[\\\t\n\r]/g;
@@ -15,6 +19,8 @@ const COPY_ESCAPE_MAP: Record<string, string> = {
   '\r': '\\r',
 };
 
+const MS_PER_MINUTE = 60_000;
+
 /**
  * The overwhelming majority of log fields contain no tab, newline, or
  * backslash at all. Testing first lets those return the original string
@@ -27,35 +33,39 @@ function escapeCopyValue(value: string): string {
     : value;
 }
 
+export const ingestionRoutes =
+  (pipeline: IngestPipeline): FastifyPluginAsync =>
+  async (fastify) => {
+    fastify.post('/logs', async (request, reply) => {
+      const body = request.body as any;
 
-export const ingestionRoutes = (buffer: RingBuffer<string>): FastifyPluginAsync => async (fastify) => {
-  let reqCount = 0;
+      if (!body || typeof body !== 'object' || !Array.isArray(body.logs)) {
+        return reply
+          .status(400)
+          .send({ error: 'Request body must be an object with a "logs" array' });
+      }
 
-  fastify.post('/logs', async (request, reply) => {
-    const requestStart = performance.now();
+      const logsArray = body.logs;
+      if (logsArray.length === 0) {
+        return reply.status(400).send({ error: 'Logs array cannot be empty' });
+      }
 
-    const body = request.body as any;
+      const rows: string[] = [];
+      const rollup = new Map<string, RollupDelta>();
+      const rejected: Array<{ index: number; reason: string }> = [];
 
-    if (!body || typeof body !== 'object' || !Array.isArray(body.logs)) {
-      return reply.status(400).send({ error: 'Request body must be an object with a "logs" array' });
-    }
+      const nowMs = Date.now();
+      for (let i = 0; i < logsArray.length; i++) {
+        const result = validateLogEntry(logsArray[i], nowMs);
 
-    const logsArray = body.logs;
-    if (logsArray.length === 0) {
-      return reply.status(400).send({ error: 'Logs array cannot be empty' });
-    }
+        if (!result.valid || !result.log) {
+          rejected.push({ index: i, reason: result.reason || 'Invalid entry' });
+          continue;
+        }
 
-    let accepted = 0;
-    const rejected: Array<{ index: number; reason: string }> = [];
-
-    const nowMs = Date.now();
-    for (let i = 0; i < logsArray.length; i++) {
-      const result = validateLogEntry(logsArray[i], nowMs);
-
-      if (result.valid && result.log) {
-        // Pre-serialize to TSV at ingestion time.
-        // Distributes CPU work across many small requests
-        // instead of concentrating it in one massive flush loop.
+        // Pre-serialize to the COPY wire format at ingestion time. This spreads
+        // the CPU cost across HTTP handlers instead of concentrating it in the
+        // flush, and lets the flush do nothing but concatenate and write.
         const attrs = result.log.attributes;
 
         // for-in with an immediate break instead of Object.keys(attrs).length,
@@ -63,40 +73,65 @@ export const ingestionRoutes = (buffer: RingBuffer<string>): FastifyPluginAsync 
         // whether the object is empty.
         let hasAttrs = false;
         if (attrs !== undefined && attrs !== null && typeof attrs === 'object') {
-          for (const _k in attrs) { hasAttrs = true; break; }
+          for (const _k in attrs) {
+            hasAttrs = true;
+            break;
+          }
         }
 
-        const row =
+        rows.push(
           escapeCopyValue(result.log.timestamp) + '\t' +
-          result.log.level + '\t' +                           // levels are clean enum values, no escape needed
-          escapeCopyValue(result.log.service) + '\t' +
-          escapeCopyValue(result.log.message) + '\t' +
-          (hasAttrs ? escapeCopyValue(JSON.stringify(attrs)) : '{}') + '\n';
+            result.log.level + '\t' + // levels are a closed enum; nothing to escape
+            escapeCopyValue(result.log.service) + '\t' +
+            escapeCopyValue(result.log.message) + '\t' +
+            (hasAttrs ? escapeCopyValue(JSON.stringify(attrs)) : '{}') + '\n'
+        );
 
-        if (buffer.push(row)) {
-          accepted++;
+        // Accumulate this entry into its (minute, service, level) counter. The
+        // pipeline merges these per-request maps into one per-transaction map,
+        // so the rollup upsert stays a single small statement no matter how
+        // many rows the batch carries.
+        const bucketMs =
+          Math.floor((result.timestampMs as number) / MS_PER_MINUTE) * MS_PER_MINUTE;
+        const key = `${bucketMs}|${result.log.service}|${result.log.level}`;
+        const existing = rollup.get(key);
+        if (existing) {
+          existing.count++;
         } else {
-          rejected.push({ index: i, reason: 'Buffer full (Backpressure active)' });
+          rollup.set(key, {
+            bucketMs,
+            service: result.log.service,
+            level: result.log.level,
+            count: 1,
+          });
         }
-      } else {
-        rejected.push({ index: i, reason: result.reason || 'Invalid entry' });
       }
-    }
 
-    if (accepted === 0) {
-      return reply.status(400).send({ accepted: 0, rejected });
-    }
+      // Nothing valid to persist: this is a client-side problem and no
+      // database work is involved.
+      if (rows.length === 0) {
+        return reply.status(400).send({ accepted: 0, rejected });
+      }
 
-    // Sampled diagnostic logging: every 200 requests
-    if (++reqCount % 200 === 0) {
-      console.log({
-        ingestionTime: `${(performance.now() - requestStart).toFixed(2)}ms`,
-        accepted,
-        rejected: rejected.length,
-        bufferSize: buffer.size()
-      });
-    }
+      try {
+        // Resolves only once these rows are COMMITted. Answering before that
+        // would be claiming durability the service has not achieved — the
+        // exact thing the spec forbids, and what made accepted-vs-visible
+        // diverge by hundreds of thousands of records.
+        await pipeline.submit(rows, rollup);
+      } catch (err) {
+        // Shed load explicitly rather than acknowledging writes that did not
+        // happen. 503 + Retry-After is the spec's sanctioned backpressure
+        // signal; 4xx would wrongly blame the client for a well-formed
+        // request.
+        const retryAfter =
+          err instanceof BackpressureError ? err.retryAfterSeconds : 1;
+        return reply
+          .status(503)
+          .header('Retry-After', String(retryAfter))
+          .send({ error: 'Ingestion is temporarily saturated; please retry' });
+      }
 
-    return reply.status(200).send({ accepted, rejected });
-  });
-};
+      return reply.status(200).send({ accepted: rows.length, rejected });
+    });
+  };

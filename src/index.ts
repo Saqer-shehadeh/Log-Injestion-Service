@@ -1,7 +1,6 @@
 import Fastify from 'fastify';
 import { Pool } from 'pg';
-import { RingBuffer } from './buffer/ring-buffer';
-import { LogWorker } from './worker/log-worker';
+import { IngestPipeline } from './ingest/ingest-pipeline';
 import { healthRoutes } from './routes/health';
 import { ingestionRoutes } from './routes/ingestion';
 import { queryRoutes } from './routes/query';
@@ -20,39 +19,28 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || DEFAULT_RETENTION_D
 
 const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
 
-// Set synchronous_commit = off on every new PG connection for write throughput.
-// Data is still WAL-logged — only the fsync-before-ack is deferred, which is
-// consistent with this service already acking before the row is durable.
-// (This previously said `on` while the comment claimed the benefit of `off`.)
-pgPool.on('connect', (client: any) => {
-  client.query('SET synchronous_commit = off');
-});
-
+// synchronous_commit is set as the server default in docker-compose.yml, so
+// there is deliberately no per-connection SET here. The previous fire-and-forget
+// `client.query()` in a 'connect' handler raced the first real query on that
+// connection (pg's "client.query() when the client is already executing a
+// query is deprecated" warning) and cost a round-trip on every new connection,
+// to re-apply a value the server already had.
 pgPool.on('error', (err: Error) => {
   console.error('Unexpected error on idle PostgreSQL client:', err);
 });
 
-// Buffer stores pre-serialized TSV strings (not objects).
-//
-// Capacity is bounded by the V8 heap, not by how much we'd *like* to absorb.
-// Each buffered row retains ~216 bytes (measured: ~81 chars of data plus V8
-// string/cons-string overhead), so the previous 500,000 capacity was ~103MB of
-// heap for the buffer alone — over half the entire budget. Combined with
-// Fastify, pg, and in-flight request bodies that drove the process into a GC
-// death spiral (~87% of CPU in GC) and then a hard V8 abort.
-//
-// The spiral was self-reinforcing, which is why throughput *decayed* rather
-// than simply plateauing: the LogWorker flush loop shares this event loop with
-// the HTTP handlers, so GC pressure stole time from the drain, which let the
-// buffer grow faster, which raised GC pressure again.
-//
-// 200,000 entries ≈ 43MB — enough to absorb ~13s of the 15k logs/sec target
-// while the worker drains, with the heap headroom to survive doing it.
-const logBuffer = new RingBuffer<string>(200_000);
-
-// Adaptive worker: base batch 4000, poll interval 50ms. Concurrency is
-// fixed at 1 inside LogWorker (see its maxConcurrent comment).
-const worker = new LogWorker(logBuffer, pgPool, 4000, 50);
+// Ingestion is group-commit: a request is answered only once the transaction
+// carrying its rows has committed. Memory is therefore bounded by in-flight
+// request concurrency (rows live for the ~20-30ms until their batch commits),
+// not by a capacity constant that has to be guessed against the V8 heap.
+// maxPendingRows is a safety ceiling for the case where Postgres stalls
+// entirely; at ~200 bytes retained per serialized row it is ~10MB.
+// See src/ingest/ingest-pipeline.ts for the full rationale.
+const pipeline = new IngestPipeline(pgPool, {
+  minBatchRows: 4000,
+  maxBatchDelayMs: 20,
+  maxPendingRows: 50_000,
+});
 // CPU profiling under sustained ingestion put `secure-json-parse` at 24.7% of
 // total process CPU — more than every line of this codebase combined, and the
 // single largest consumer. Fastify's default JSON body parser runs two
@@ -98,7 +86,7 @@ let partitionMaintenance: { stop: () => void } | null = null;
 // Graceful shutdown: registered once, up front, so SIGTERM/SIGINT are
 // handled even if they arrive during the startup DB-connect retry loop.
 // Both signals are wired to the same idempotent shutdown function.
-const shutdown = createGracefulShutdown({ fastify, worker, pgPool });
+const shutdown = createGracefulShutdown({ fastify, worker: pipeline, pgPool });
 process.on('SIGTERM', () => { partitionMaintenance?.stop(); void shutdown('SIGTERM'); });
 process.on('SIGINT', () => { partitionMaintenance?.stop(); void shutdown('SIGINT'); });
 
@@ -107,7 +95,10 @@ async function main() {
     let connected = false;
     while (!connected) {
       try {
-        await initDb(pgPool);
+        // Pre-create partitions across the whole retention window, not just
+        // today onward, so month-old timestamps land in real prunable
+        // partitions instead of the catch-all DEFAULT partition.
+        await initDb(pgPool, { partitionBehindDays: RETENTION_DAYS });
         connected = true;
       } catch (e) {
         console.log('Waiting for Postgres to accept connections...');
@@ -116,11 +107,11 @@ async function main() {
     }
 
     await fastify.register(healthRoutes(pgPool));
-    await fastify.register(ingestionRoutes(logBuffer));
+    await fastify.register(ingestionRoutes(pipeline));
     await fastify.register(queryRoutes(pgPool));
     await fastify.register(aggregateRoutes(pgPool));
 
-    worker.start();
+    pipeline.start();
     partitionMaintenance = startPartitionMaintenance(pgPool, { retentionDays: RETENTION_DAYS });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });

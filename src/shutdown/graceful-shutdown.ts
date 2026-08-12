@@ -3,9 +3,10 @@
  *
  * Sequence:
  *   1. Stop accepting new HTTP requests  (fastify.close())
- *   2. Stop the worker from starting new flushes, wait for any in-flight
- *      COPY to finish, then drain the RingBuffer using the existing
- *      peekBatch -> flushBatch -> drop safe sequence  (worker.shutdown())
+ *   2. Stop accepting new ingest work, commit everything already queued or in
+ *      flight, and answer every request still waiting on it — either with a
+ *      successful commit or an explicit failure, never silently
+ *      (worker.shutdown())
  *   3. Close the PostgreSQL pool          (pgPool.end())
  *   4. Exit
  *

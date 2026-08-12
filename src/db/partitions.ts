@@ -70,6 +70,32 @@ export async function ensureUpcomingPartitions(
 }
 
 /**
+ * Ensures partitions exist across the whole live window: `behindDays` days in
+ * the past through `aheadDays` days in the future.
+ *
+ * The past side matters because the project spec describes the graded dataset
+ * as "approximately one month of data". Only pre-creating today-and-forward
+ * means every backdated entry falls through to the DEFAULT partition, which
+ * (a) defeats partition pruning for every query touching it, and (b) is never
+ * reclaimed, because dropExpiredPartitions deliberately never drops
+ * logs_default. Creating the retention window up front keeps historical rows
+ * in real, prunable, droppable partitions.
+ *
+ * Safe to call repeatedly — every create is IF NOT EXISTS.
+ */
+export async function ensurePartitionWindow(
+  pgPool: Pool,
+  behindDays: number,
+  aheadDays: number = DEFAULT_PARTITION_AHEAD_DAYS,
+  now: Date = new Date()
+): Promise<void> {
+  const today = startOfUtcDay(now);
+  for (let i = -behindDays; i <= aheadDays; i++) {
+    await ensureDailyPartition(pgPool, new Date(today.getTime() + i * MS_PER_DAY));
+  }
+}
+
+/**
  * Drops daily partitions that are entirely older than the retention
  * window, using ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY followed
  * by DROP TABLE, instead of a bulk DELETE. DETACH CONCURRENTLY avoids

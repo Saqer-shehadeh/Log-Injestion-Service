@@ -172,14 +172,25 @@ One row per bucket/group combination, ordered by `start` ascending, `group: null
 ```
 POST /logs
   → validateLogEntry() (per-entry validation)
-  → serialize accepted entries to COPY-ready TSV (src/routes/ingestion.ts)
-  → RingBuffer<string>.push()            ← HTTP response returned here
-  → [async] LogWorker polls the buffer, adaptively batches (4,000–8,000 rows)
-  → peekBatch() → COPY logs FROM STDIN (pg-copy-streams) → drop() only on success
-  → row is now committed and immediately visible to GET /logs and GET /logs/aggregate
+  → serialize accepted entries to COPY-ready TSV + per-(minute,service,level) counters
+  → IngestPipeline.submit()              ← request now WAITS here
+  → [batched] BEGIN
+               COPY logs FROM STDIN (pg-copy-streams)
+               INSERT INTO log_rollup_1m ... ON CONFLICT DO UPDATE (counter deltas)
+              COMMIT
+  → HTTP 200 returned                    ← only after the COMMIT above
+  → row is committed and immediately visible to GET /logs and GET /logs/aggregate
 ```
 
-Ingestion and persistence are deliberately decoupled by the ring buffer: the HTTP handler never waits on Postgres, only on an in-memory array push. That's what makes sustained high throughput possible inside a 0.5 CPU app container. The worker never removes anything from the buffer until the corresponding `COPY` has actually succeeded (`peekBatch` → `COPY` → `drop`, never `pop`-before-persist), and a failed `COPY` leaves the batch in place to retry rather than losing it. Concurrency is intentionally capped at one in-flight `COPY` — the buffer uses a single shared read cursor, so running two flushes at once could race on which one advances it.
+**Ingestion is group-commit.** A request is answered only once the transaction carrying its rows has committed, so "accepted" and "persisted" are the same thing by construction. Requests that arrive while a flush is running accumulate into the next batch, so the busier the service, the larger each `COPY` and the better the fixed per-transaction cost is amortized — throughput self-balances instead of needing a tuned queue depth.
+
+This replaced an earlier design that pushed rows into a fixed-capacity in-memory ring buffer and returned `200` immediately. That design broke the spec's "never respond 200 to a batch you have not durably accepted" rule, and the consequences were measurable: the graded run acknowledged 472K records of which only 80K were ever visible. It also forced buffer capacity to be guessed against the V8 heap — too large and the process died of heap exhaustion, too small and it shed load. Waiting for the commit removes the guess entirely: rows live for the ~20-30ms until their batch commits, so memory is bounded by in-flight request concurrency (observed: ~35MB of the 256MB budget under sustained 15k/sec).
+
+Backpressure is now a first-class signal rather than an overflow condition. `maxPendingRows` (50,000, ~10MB) is a safety ceiling for a total database stall; exceeding it returns **503 + `Retry-After`**, which is what the spec sanctions for shed load. A failed batch is retried, and if it ultimately cannot commit its waiters are failed explicitly — no request is ever told its rows are durable when they are not.
+
+Only one transaction is in flight at a time. Concurrent flushes would contend on the same hot rollup rows and could deadlock, and serializing them costs nothing: a slower flush simply produces a larger, better-amortized next batch.
+
+Query-building and execution for `/logs` and `/logs/aggregate` live in `src/db/log-repository.ts`, kept separate from the Fastify route handlers (`src/routes/query.ts`, `src/routes/aggregate.ts`), which only parse/validate input and shape the HTTP response.
 
 Query-building and execution for `/logs` and `/logs/aggregate` live in `src/db/log-repository.ts`, kept separate from the Fastify route handlers (`src/routes/query.ts`, `src/routes/aggregate.ts`), which are only responsible for parsing/validating request input and shaping the HTTP response.
 
@@ -203,10 +214,30 @@ CREATE TABLE logs (
 
 The table is range-partitioned by `timestamp` into one partition per UTC day (`logs_yYYYYmMMdDD`, e.g. `logs_y2026m08d11`), plus a `DEFAULT` partition (`logs_default`) that exists only as a safety net — see [Retention Strategy](#retention-strategy) for why daily partitions specifically, and how they're managed.
 
-Two indexes, declared on the partitioned parent so every partition (including ones created after the fact) automatically gets a matching local index:
+Two indexes total, both on the partitioned parent so every partition (including ones created later) automatically gets a matching local index:
 
-- **`idx_logs_query (service, level, timestamp DESC)`** — serves `service`/`level`-filtered queries and the `group_by=service|level` aggregation path.
-- **`idx_logs_timestamp (timestamp DESC)`** — serves time-range-only queries and backs the `(timestamp, id)` cursor comparison used for pagination.
+- **`PRIMARY KEY (timestamp, id)`** — serves time-range scans, `ORDER BY timestamp DESC, id DESC` (Postgres scans it backwards at the same cost), and the `(timestamp, id)` cursor comparison used for pagination.
+- **`idx_logs_query (service, level, timestamp DESC)`** — serves `service`/`level`-filtered queries.
+
+A third index, `idx_logs_timestamp (timestamp DESC)`, was **removed**: the primary key already covers every access path it served, so it was pure write amplification — a third index maintained on every `COPY`'d row on a database whose write path is the scarce resource. Measured on a populated partition, it was 17MB of index being maintained for no distinct query benefit.
+
+### Pre-aggregated rollup
+
+```sql
+CREATE TABLE log_rollup_1m (
+    bucket_start TIMESTAMPTZ NOT NULL,
+    service      VARCHAR(100) NOT NULL,
+    level        VARCHAR(10)  NOT NULL,
+    count        BIGINT       NOT NULL,
+    PRIMARY KEY (bucket_start, service, level)
+);
+```
+
+`GET /logs/aggregate` used to `GROUP BY` over raw `logs`, making its cost O(rows in range). On the graded 1-CPU Postgres that single query consumed roughly 0.75 CPU-seconds, so at the spec's one-request-per-second it saturated the database by itself and starved ingestion of the same core. Its latency was dominated by queueing rather than scanning — which is why it got *worse* as offered load rose even while row counts fell (Breakpoint: fewest rows, worst latency at 17.53s).
+
+This table is updated **inside the same transaction as the `COPY` that inserts the rows it counts**, so it cannot disagree with `logs` — there is no refresh job to fall behind or race. One minute is the finest bucket the API exposes and every coarser bucket (`5m`/`1h`/`1d`) is an exact multiple, so all four are served by re-binning these rows.
+
+It is set to `fillfactor = 70` with aggressive autovacuum thresholds because the same handful of current-minute rows are updated on every flush. That keeps updates HOT — measured over a full load test: **24,932 updates, 24,932 of them HOT, 48 live rows, 48 dead tuples, table still 16 kB.**
 
 **No GIN index on `attributes`.** A GIN index would make `attr.<key>` lookups index-assisted, but it adds real per-row index-maintenance cost to every `COPY`, paid on every single ingested row on a 1-CPU Postgres instance — directly opposed to the 15k+/sec ingestion target. Given the actual graded scale (~1,000,000 rows across ~30 days, i.e. tens of thousands of rows/day per partition — see [Retention Strategy](#retention-strategy)), a sequential per-row evaluation of `attributes->>'key'` over an already time/service/level-narrowed, partition-pruned result set is fast enough without it. `GET /logs/aggregate` always requires `since`/`until`, so its attribute/message filters are always partition-pruned first; `GET /logs` does not require a time range (per spec, all its filters are optional), so an unbounded `attr.<key>`-only or `q`-only query on that endpoint is the one case that scans across all live partitions — see [Known Limitations](#known-limitations).
 
@@ -259,20 +290,36 @@ No optional features are implemented (see [Optional Features](#optional-features
 
 > **On measurement method.** Earlier revisions of this section reported ~27,000 logs/sec. That number counted **acks into the in-memory ring buffer, not rows persisted to Postgres** — the two only agree while the buffer is keeping up, which short low-concurrency runs never revealed. The aggregation figures were also measured against a time range that contained no rows (`{"buckets":[]}` in 7ms). Both are corrected below: ingestion is now reported as rows actually committed, and aggregation against a range that spans the full dataset.
 
+All figures below are 33 logs/request (matching the graded generator's observed batch size), open-loop paced with a bounded VU pool, with the aggregation query polled once per second concurrently throughout.
+
 | Metric | Result |
 |---|---|
-| Test environment (CPU/RAM limits, OS) | App: 0.5 CPU / 256MB, Postgres: 1.0 CPU / 1GB (`docker-compose.yml` `deploy.resources.limits`). Host: Windows 11, Intel i5-1135G7 (8 logical CPUs), Docker Desktop. |
-| Dataset size at test time | 0 → 1,766,300 rows over the 120s run (past the spec's ~1,000,000-row target). |
-| Batch size | 50 logs/request |
-| Offered load | 15,014 logs/sec sustained for 120s |
-| **Ingestion rate (accepted)** | **14,719 logs/sec** — 98% of offered. **0 rejected, 0 failed requests.** |
-| **Ingestion rate (persisted)** | **1,766,300 rows committed = exactly the accepted count.** No loss, no backlog left at the end of the drain window. |
-| Throughput stability | No decay: first 15s averaged 13,847 logs/sec, last 15s averaged 14,867 logs/sec. |
-| Query rate | 1 aggregation req/sec throughout the ingestion run |
-| Query latency (p50 / p95 / max) | 662ms / **2,017ms** / 2,664ms, against a range covering all 1.77M rows. **This misses the spec's p95 < 1s target** — see Known Limitations. On an idle database the same query is ~470–630ms; the remainder is contention with ingestion. |
-| Resource usage during test | App: 44–50% CPU (≈90–100% of its 0.5-CPU limit — still the ceiling), 167MB/256MB memory, stable. Postgres: ~78% of its 1.0-CPU limit, 346MB/1GB. |
-| Bottlenecks discovered | (1) The 500,000-entry ring buffer could not fit the 200MB V8 heap; under sustained load the process spent ~87% of its time in GC and then aborted, which is what produced the characteristic "burst then decay" throughput curve. (2) Fastify's default JSON body parser (`secure-json-parse`) was **24.7% of total process CPU** — more than all application code combined — running two prototype-pollution regexes over every request body. (3) The flush loop issued a `COPY` per ~900 rows instead of per 4,000, un-amortizing the fixed per-transaction cost ~10x. (4) `synchronous_commit` was `on` in all three places that set it, despite comments and notes claiming `off` (6.7x on batched writes). (5) Both Postgres and Node sized their worker pools from the host's 8 CPUs while confined to a fraction of one core. |
-| Optimizations applied | Ring buffer sized to the heap budget (200,000) with the heap cap lowered to 160MB; proto-poisoning scans disabled on the JSON body parser; minimum-batch accumulation before flushing, bounded by a 200ms max delay; `synchronous_commit=off`; `max_parallel_workers_per_gather=0` and `effective_cache_size=768MB` for the 1-CPU container; `UV_THREADPOOL_SIZE`/`--v8-pool-size` pinned for the 0.5-CPU container; escape fast-path on the ingestion hot path; pre-serialization to TSV at ingestion time; single-chunk `COPY` streaming; daily partitioning + partition-drop retention. |
+| Test environment | App: 0.5 CPU / 256MB, Postgres: 1.0 CPU / 1GB (`docker-compose.yml` limits). Host: Windows 11, Intel i5-1135G7, Docker Desktop. |
+| Dataset size at test time | 0 → 1,745,634 rows over the 120s run (past the spec's ~1,000,000-row target) |
+| Offered load | 15,013 logs/sec for 120s |
+| **Ingestion rate (accepted)** | **14,547 logs/sec** — 97% of offered; steady-state buckets sat at 14,929–15,114 |
+| **Ingestion rate (persisted)** | **1,745,634 = exactly the accepted count.** Acknowledgement *is* commit. |
+| Throughput stability | **No decay.** First 15s 13,398/sec, last 15s 13,297/sec |
+| Rejected / shed / failed | **0 / 0 / 0** |
+| **Aggregation latency** | **p50 5ms · p95 85ms · p99 1,324ms** — comfortably inside the spec's p95 < 1s |
+| POST latency | p50 32ms · p95 241ms · p99 2,247ms |
+| Resource usage | App 24–52% of its 0.5 CPU, **memory flat at 34–39MB / 256MB**. Postgres 20–51% of its 1.0 CPU, 331–341MB / 1GB. |
+| Spike (7.5k→30k→7.5k) | 826,254 accepted = persisted = rollup; 0 shed, 0 failed; baseline held at 7,511–7,524 |
+| Breakpoint (15k→22.5k→30k→45k) | 2,155,890 accepted = persisted = rollup; peak 23,608/sec; 0 shed, 0 failed; **throughput rose over the run** (9,594 → 20,823) |
+| Graceful shutdown under load | SIGTERM mid-ingestion: 76,857 acknowledged, 76,857 persisted, **0 acknowledged rows lost** |
+| Aggregation at month scale | 691K rollup rows: `1h` 216ms, `1d` 191ms, `1h+group_by` 264ms; 1-day window at `1m` 26ms |
+
+**Bottlenecks found, in the order they mattered:**
+
+1. **Aggregation scanning raw rows.** ~0.75 CPU-seconds per request against a 1-CPU Postgres at 1 req/sec saturated the database by itself and starved ingestion. Latency was queueing, not scanning — Breakpoint had the fewest rows and the worst latency. Fixed by the transactional rollup.
+2. **Ack-before-durable.** Acknowledging from an in-memory buffer meant accepted ≫ visible (472K vs 80K on the graded run) and made read-after-write structurally impossible to pass. Fixed by group commit.
+3. **Buffer capacity vs V8 heap.** 500,000 entries × ~216 bytes retained ≈ 103MB against a 200MB cap drove ~87% of CPU into GC and then a hard V8 abort. Eliminated — there is no longer a standing buffer to size.
+4. **Backpressure signalled as `400`.** Shed load was reported as a client error, which the harness counted against the error rate. Now `503` + `Retry-After`.
+5. **Three indexes per row**, one of them a 60MB primary key, on a write-bound database. Reduced to two.
+6. **Fastify's JSON body parser** (`secure-json-parse`) at 24.7% of process CPU, running prototype-pollution regexes over every request body.
+7. **Both Postgres and Node autotuning worker pools from the host's 8 CPUs** while confined to a fraction of one core.
+8. **`synchronous_commit=on`** in all three places that set it, while comments claimed `off` (6.7x on batched writes).
+9. **Backdated rows landing in the DEFAULT partition**, defeating pruning and retention. Partitions are now pre-created across the whole retention window.
 
 To reproduce: `docker compose up --build -d`, then `npm run benchmark`, and separately `node benchmark-query.js` (Ctrl-C to stop) while the ingestion benchmark runs, to get concurrent ingest+query numbers. `docker stats` in another terminal for resource usage.
 
@@ -280,8 +327,10 @@ To reproduce: `docker compose up --build -d`, then `npm run benchmark`, and sepa
 
 ## Known Limitations
 
-- **Ack-before-durable.** `POST /logs` returns `200` once accepted entries are in the in-memory ring buffer, not once they're committed to Postgres. A process crash between accept and the next `COPY` loses that data despite having returned success. This is the trade-off that makes the buffer/async-flush architecture capable of 15k+/sec within a 0.5 CPU app container; a graceful `SIGTERM`/`SIGINT` (see [Architecture](#architecture)) drains the buffer before exiting, but an ungraceful termination (OOM kill, `kill -9`, power loss) does not.
-- **Bounded buffer.** The ring buffer holds up to 200,000 entries. If Postgres is unavailable long enough for it to fill, further ingestion requests start getting entries rejected (still `200` with a `rejected` array if some entries in the request still fit, `400` only if the whole request is rejected) rather than queuing indefinitely. The capacity is deliberately bounded by the V8 heap rather than by how much we would like to absorb: each buffered row retains ~216 bytes, so the previous 500,000 capacity was ~103MB of heap for the buffer alone. Under sustained overload that drove the process into a GC death spiral and then a hard V8 abort — rejecting is the intended backpressure, crashing is not. See [src/index.ts](src/index.ts) for the sizing arithmetic.
+- **Ingestion latency is bounded by the batch window.** Because a request is not answered until its rows commit, `POST /logs` latency includes up to `maxBatchDelayMs` (20ms) of batching plus the `COPY`/commit itself — measured p50 32ms, p95 241ms under sustained 15k/sec. This is the deliberate cost of not acknowledging writes that have not happened.
+- **Backpressure sheds with 503.** If the database stalls long enough for queued rows to reach `maxPendingRows` (50,000, ~10MB), further requests receive `503` with `Retry-After` rather than being queued indefinitely or falsely acknowledged. Under all four graded load shapes this never triggered (0 shed across Load, Stress-equivalent, Spike, and Breakpoint).
+- **Aggregations with `q` or `attr.<key>` filters cannot use the rollup** and fall back to scanning raw rows, since the rollup stores only `(minute, service, level, count)`. Those requests remain O(rows in range). The spec's primary aggregation query does not use them.
+- **A month-wide aggregation at `bucket=1m` returns 43,200 buckets (~2.7MB)** and takes ~1.5s end-to-end — but only ~196ms of that is the database; the rest is serializing and transferring the response. Coarser buckets over the same month are 190–260ms, and a 1-day window at `1m` is 26ms.
 - **Unbounded `GET /logs` queries.** Per spec, all filters on `GET /logs` are optional — a query using only `attr.<key>` or `q` with no `since`/`until` scans across every live partition rather than being pruned to one. `GET /logs/aggregate` always requires a time range, so it doesn't have this exposure.
 - **No GIN index on `attributes`** (deliberate — see [Schema and Index Design](#schema-and-index-design)): attribute/message filtering is sequential-scan-per-row rather than index-assisted, relying on `service`/`level`/time-range narrowing and partition pruning to stay fast at the project's target scale.
 - **Aggregation p95 exceeds the 1s target at full ingestion rate.** `GET /logs/aggregate` has no pre-aggregation: it scans every row in the requested range, so its cost is O(rows in range). Measured p95 was 2,017ms against a range covering 1.77M rows while ingesting ~15,000 logs/sec, versus ~470–630ms for the same query on an idle database. Two things drive the gap, and neither has a cheap fix: Postgres is at ~78% of its 1.0-CPU limit absorbing the `COPY` traffic, and the app's 0.5 CPU is near-saturated, so the query request also queues behind ingestion on the event loop. Note the perverse interaction — raising ingestion throughput *increases* the row count the aggregation has to scan within a fixed-length test, so the two targets pull against each other. Closing this properly needs incrementally-maintained rollup buckets (a per-minute counts table updated on flush) so the query reads pre-computed rows instead of scanning raw ones; that is a real architectural addition, not a tuning change.

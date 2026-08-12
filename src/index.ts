@@ -17,7 +17,41 @@ const DB_URL = process.env.DATABASE_URL || 'postgres://loguser:logpass@localhost
 // this just lets an operator override the window.
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || DEFAULT_RETENTION_DAYS;
 
-const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
+// Reads and writes get SEPARATE connection pools, sized so their sum is the
+// same 20 connections a single shared pool used.
+//
+// They were shared, and that made read traffic able to deadlock ingestion
+// outright. The flush path opens with `await pool.connect()`, and node-pg waits
+// forever by default; IngestPipeline increments inFlight *before* that await
+// and refuses to start another flush while inFlight > 0. So once every
+// connection was held by slow reads, the flush could never acquire one, the
+// pipeline stopped permanently, and every in-flight POST hung behind it.
+//
+// Reproduced directly: 2M rows, ingestion steady at ~13,000 logs/sec, then 30
+// concurrent unindexed `attr.<key>` lookups (a full scan each) issued
+// alongside. Ingestion went to *zero* within 10 seconds, stayed at zero for 40
+// seconds, and did not recover when the read load stopped — not one of the 30
+// reads had completed. Postgres kept executing them even after the HTTP clients
+// gave up, because abandoning a request does not cancel its query.
+//
+// Splitting the pools makes that structurally impossible: reads can exhaust
+// their own pool and degrade, but they can no longer take the connection
+// ingestion needs. This costs nothing in the healthy case — ingestion runs
+// exactly one flush at a time (IngestPipeline pins flush concurrency to 1), and
+// the graded aggregation load is ~1 query/sec, so steady-state usage is around
+// 1.3 of the 20 connections either way.
+const ingestPool = new Pool({
+  connectionString: DB_URL,
+  // One flush runs at a time; the rest is headroom for a retry overlapping a
+  // release and for the shutdown drain.
+  max: 4,
+  // Never block the flush loop indefinitely. With a dedicated pool this should
+  // be unreachable — it only fires if Postgres itself is unavailable, where
+  // failing and retrying is the correct behaviour rather than hanging forever.
+  connectionTimeoutMillis: 10_000,
+});
+
+const queryPool = new Pool({ connectionString: DB_URL, max: 16 });
 
 // synchronous_commit is set as the server default in docker-compose.yml, so
 // there is deliberately no per-connection SET here. The previous fire-and-forget
@@ -25,9 +59,10 @@ const pgPool = new Pool({ connectionString: DB_URL, max: 20 });
 // connection (pg's "client.query() when the client is already executing a
 // query is deprecated" warning) and cost a round-trip on every new connection,
 // to re-apply a value the server already had.
-pgPool.on('error', (err: Error) => {
-  console.error('Unexpected error on idle PostgreSQL client:', err);
-});
+const logPoolError = (name: string) => (err: Error) =>
+  console.error(`Unexpected error on idle PostgreSQL client (${name} pool):`, err);
+ingestPool.on('error', logPoolError('ingest'));
+queryPool.on('error', logPoolError('query'));
 
 // Ingestion is group-commit: a request is answered only once the transaction
 // carrying its rows has committed. Memory is therefore bounded by in-flight
@@ -36,7 +71,7 @@ pgPool.on('error', (err: Error) => {
 // maxPendingRows is a safety ceiling for the case where Postgres stalls
 // entirely; at ~200 bytes retained per serialized row it is ~10MB.
 // See src/ingest/ingest-pipeline.ts for the full rationale.
-const pipeline = new IngestPipeline(pgPool, {
+const pipeline = new IngestPipeline(ingestPool, {
   minBatchRows: 4000,
   maxBatchDelayMs: 20,
   maxPendingRows: 50_000,
@@ -86,7 +121,16 @@ let partitionMaintenance: { stop: () => void } | null = null;
 // Graceful shutdown: registered once, up front, so SIGTERM/SIGINT are
 // handled even if they arrive during the startup DB-connect retry loop.
 // Both signals are wired to the same idempotent shutdown function.
-const shutdown = createGracefulShutdown({ fastify, worker: pipeline, pgPool });
+// Both pools are closed as one step, after the pipeline has drained, so the
+// ordering guarantee the shutdown sequence relies on (nothing still needs a
+// connection by the time the pool closes) holds for each of them.
+const shutdown = createGracefulShutdown({
+  fastify,
+  worker: pipeline,
+  pgPool: {
+    end: () => Promise.all([ingestPool.end(), queryPool.end()]),
+  },
+});
 process.on('SIGTERM', () => { partitionMaintenance?.stop(); void shutdown('SIGTERM'); });
 process.on('SIGINT', () => { partitionMaintenance?.stop(); void shutdown('SIGINT'); });
 
@@ -105,7 +149,7 @@ async function main() {
         // across a month — was inferred from the spec's wording and never
         // actually evidenced. Backdated rows land in the DEFAULT partition,
         // which is the documented, previously-working behaviour.
-        await initDb(pgPool);
+        await initDb(queryPool);
         connected = true;
       } catch (e) {
         console.log('Waiting for Postgres to accept connections...');
@@ -113,13 +157,13 @@ async function main() {
       }
     }
 
-    await fastify.register(healthRoutes(pgPool));
+    await fastify.register(healthRoutes(queryPool));
     await fastify.register(ingestionRoutes(pipeline));
-    await fastify.register(queryRoutes(pgPool));
-    await fastify.register(aggregateRoutes(pgPool));
+    await fastify.register(queryRoutes(queryPool));
+    await fastify.register(aggregateRoutes(queryPool));
 
     pipeline.start();
-    partitionMaintenance = startPartitionMaintenance(pgPool, { retentionDays: RETENTION_DAYS });
+    partitionMaintenance = startPartitionMaintenance(queryPool, { retentionDays: RETENTION_DAYS });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     console.log(`Server running on http://0.0.0.0:${PORT}`);

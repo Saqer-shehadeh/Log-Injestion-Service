@@ -51,7 +51,7 @@ const ingestPool = new Pool({
   connectionTimeoutMillis: 10_000,
 });
 
-// User-facing reads: GET /logs and GET /logs/aggregate.
+// User-facing reads: GET /logs and GET /logs/aggregate
 //
 // Size is deliberately left at 16, unchanged from the configuration that
 // scored a full Performance mark. Raising it to 24 was tried and reverted: the

@@ -2,6 +2,7 @@ import { FastifyPluginAsync } from 'fastify';
 import { Pool } from 'pg';
 import { isValidAttributeKey } from '../validation/log-validator';
 import { AttrFilter, queryLogs } from '../db/log-repository';
+import { respondToQueryError } from './query-errors';
 
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 const DEFAULT_LIMIT = 100;
@@ -101,8 +102,10 @@ export const queryRoutes = (pgPool: Pool): FastifyPluginAsync => async (fastify)
       const logs = rows.map(({ cursor_ts, ...row }) => row);
 
       return reply.status(200).send({ logs, next_cursor: nextCursor });
-    } catch (err: any) {
-      return reply.status(400).send({ error: err.message });
+    } catch (err) {
+      // Only a genuinely invalid query is the caller's fault; timeouts and pool
+      // exhaustion are ours. See respondToQueryError.
+      return respondToQueryError(reply, err);
     }
   });
 };

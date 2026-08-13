@@ -54,10 +54,27 @@ export interface LogsQueryOptions {
   limit: number;
 }
 
+/**
+ * Raised when the caller's query parameters are themselves invalid, as opposed
+ * to the database failing to answer a well-formed query.
+ *
+ * The distinction matters at the HTTP boundary: this is the only case that
+ * warrants a 4xx. Route handlers previously mapped *every* thrown error to 400,
+ * which meant a statement timeout or an exhausted connection pool — both purely
+ * server-side conditions — were reported to the client as though it had sent a
+ * bad request.
+ */
+export class InvalidQueryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidQueryError';
+  }
+}
+
 function assertValidAttrFilters(attrFilters: AttrFilter[]): void {
   for (const { key } of attrFilters) {
     if (!isValidAttributeKey(key)) {
-      throw new Error(`Invalid attribute key format: '${key}'`);
+      throw new InvalidQueryError(`Invalid attribute key format: '${key}'`);
     }
   }
 }

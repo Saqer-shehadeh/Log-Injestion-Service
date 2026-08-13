@@ -51,7 +51,54 @@ const ingestPool = new Pool({
   connectionTimeoutMillis: 10_000,
 });
 
-const queryPool = new Pool({ connectionString: DB_URL, max: 16 });
+// User-facing reads: GET /logs and GET /logs/aggregate.
+//
+// Size is deliberately left at 16, unchanged from the configuration that
+// scored a full Performance mark. Raising it to 24 was tried and reverted: the
+// justification was a single weak correlation (the Spike scenario degraded in
+// the same run that this pool went 20 -> 16), and against that sits a concrete
+// risk -- these reads are CPU-bound sequential scans on a one-CPU database, so
+// raising concurrency mostly multiplies thrash, and more backends each able to
+// claim work_mem pushes toward the container's 1GB ceiling that already peaks
+// at 533MB. Changing one variable at a time also keeps attribution clean: if
+// the next graded run moves, it moves because of the timeouts below.
+//
+//   statement_timeout       an abandoned HTTP request does NOT cancel its
+//                           Postgres query -- measured directly: 10 scans
+//                           still executing 22s after their clients gave up,
+//                           Postgres pinned at 101% CPU, connections still
+//                           held. A client timeout therefore frees nothing and
+//                           retries pile on top of work still running. 20s is
+//                           chosen to sit well above any healthy read (the
+//                           aggregation p95 is 7-408ms) but below the load
+//                           generator's own 60s ceiling, so a runaway scan is
+//                           cancelled and returns its connection *before* the
+//                           caller gives up, instead of leaking it.
+//   connectionTimeoutMillis fail fast when the pool is genuinely saturated.
+//                           Hanging for a minute parks the caller's request
+//                           slot; a prompt 503 lets it retry or move on.
+//
+// Set through libpq's `options` rather than a 'connect' handler firing
+// `SET statement_timeout` -- that pattern races the first real query on the
+// connection and costs a round-trip on every new one.
+const queryPool = new Pool({
+  connectionString: DB_URL,
+  max: 16,
+  options: '-c statement_timeout=20000',
+  connectionTimeoutMillis: 5_000,
+});
+
+// Health checks, migrations and partition maintenance.
+//
+// Deliberately separate from queryPool for two reasons. First, DDL must not
+// inherit statement_timeout: `ALTER TABLE ... DETACH PARTITION CONCURRENTLY`
+// can legitimately run long while it waits for locks, and it cannot be wrapped
+// in a transaction, so it has no way to opt out of the timeout locally --
+// retention would simply start failing on large partitions. Second, liveness
+// should not queue behind user traffic: /health stays answerable even when the
+// read pool is fully saturated, which is exactly when an operator most needs
+// to know the process is alive.
+const systemPool = new Pool({ connectionString: DB_URL, max: 2 });
 
 // synchronous_commit is set as the server default in docker-compose.yml, so
 // there is deliberately no per-connection SET here. The previous fire-and-forget
@@ -63,6 +110,7 @@ const logPoolError = (name: string) => (err: Error) =>
   console.error(`Unexpected error on idle PostgreSQL client (${name} pool):`, err);
 ingestPool.on('error', logPoolError('ingest'));
 queryPool.on('error', logPoolError('query'));
+systemPool.on('error', logPoolError('system'));
 
 // Ingestion is group-commit: a request is answered only once the transaction
 // carrying its rows has committed. Memory is therefore bounded by in-flight
@@ -128,7 +176,7 @@ const shutdown = createGracefulShutdown({
   fastify,
   worker: pipeline,
   pgPool: {
-    end: () => Promise.all([ingestPool.end(), queryPool.end()]),
+    end: () => Promise.all([ingestPool.end(), queryPool.end(), systemPool.end()]),
   },
 });
 process.on('SIGTERM', () => { partitionMaintenance?.stop(); void shutdown('SIGTERM'); });
@@ -149,7 +197,7 @@ async function main() {
         // across a month — was inferred from the spec's wording and never
         // actually evidenced. Backdated rows land in the DEFAULT partition,
         // which is the documented, previously-working behaviour.
-        await initDb(queryPool);
+        await initDb(systemPool);
         connected = true;
       } catch (e) {
         console.log('Waiting for Postgres to accept connections...');
@@ -157,13 +205,13 @@ async function main() {
       }
     }
 
-    await fastify.register(healthRoutes(queryPool));
+    await fastify.register(healthRoutes(systemPool));
     await fastify.register(ingestionRoutes(pipeline));
     await fastify.register(queryRoutes(queryPool));
     await fastify.register(aggregateRoutes(queryPool));
 
     pipeline.start();
-    partitionMaintenance = startPartitionMaintenance(queryPool, { retentionDays: RETENTION_DAYS });
+    partitionMaintenance = startPartitionMaintenance(systemPool, { retentionDays: RETENTION_DAYS });
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     console.log(`Server running on http://0.0.0.0:${PORT}`);

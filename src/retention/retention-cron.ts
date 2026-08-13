@@ -4,7 +4,7 @@ import { DEFAULT_PARTITION_AHEAD_DAYS, dropExpiredPartitions, ensureUpcomingPart
 /**
  * Project spec: "Handle approximately 1,000,000 stored log records. Assume
  * those records represent approximately one month of data." 30 days is the
- * retention window that matches that sizing target.
+ * retention window that matches that sizing target
  */
 export const DEFAULT_RETENTION_DAYS = 30;
 

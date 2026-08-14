@@ -123,6 +123,13 @@ const pipeline = new IngestPipeline(ingestPool, {
   minBatchRows: 4000,
   maxBatchDelayMs: 20,
   maxPendingRows: 50_000,
+  // maxConcurrentFlushes is deliberately left at its default of 1. Overlapping
+  // flushes were implemented and swept (1 vs 3) against a real database and
+  // made throughput *worse*: three batches accumulating in parallel each take a
+  // third of the arrival rate, so mean batch size fell 3,231 -> 1,717 rows and
+  // transaction count rose 233 -> 405, amortizing the fixed per-transaction
+  // cost across half as many rows. Steady-state throughput 18,084 -> 17,672
+  // logs/sec, peak 20,394 -> 19,582.
 });
 // CPU profiling under sustained ingestion put `secure-json-parse` at 24.7% of
 // total process CPU — more than every line of this codebase combined, and the

@@ -102,7 +102,7 @@ const systemPool = new Pool({ connectionString: DB_URL, max: 2 });
 
 // synchronous_commit is set as the server default in docker-compose.yml, so
 // there is deliberately no per-connection SET here. The previous fire-and-forget
-// `client.query()` in a 'connect' handler raced the first real query on tha
+// `client.query()` in a 'connect' handler raced the first real query on that
 // connection (pg's "client.query() when the client is already executing a
 // query is deprecated" warning) and cost a round-trip on every new connection,
 // to re-apply a value the server already had.

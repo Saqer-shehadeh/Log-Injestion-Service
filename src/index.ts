@@ -121,7 +121,30 @@ systemPool.on('error', logPoolError('system'));
 // See src/ingest/ingest-pipeline.ts for the full rationale.
 const pipeline = new IngestPipeline(ingestPool, {
   minBatchRows: 4000,
-  maxBatchDelayMs: 20,
+  // Dominant term in ingestion response latency: a request cannot be answered
+  // until its batch commits, so this sets the floor on how long a POST takes.
+  //
+  // Swept against a real database at the graded Load profile (15,000 logs/sec,
+  // 33 logs/request), two runs per value:
+  //
+  //   delay   accepted (run1/run2)   ingest p50   ingest p95    aggregate p95
+  //     20ms  14,405 / 13,472        37 / 34ms    889 / 1462ms  337 / 570ms
+  //     10ms  14,910 / 14,491        24 / 25ms    398 /  498ms  158 /  84ms
+  //      5ms  14,099                 27ms        1109ms         660ms
+  //
+  // 10ms is reproducibly better than 20ms on every axis, and the p50 drop is
+  // exactly the delay reduction, which is the mechanically expected result.
+  // 5ms is worse: batches fragment (351 rows vs 577), transaction rate rises
+  // to 40/sec, and Postgres CPU spiked to 106% — past the point where smaller
+  // batches stop paying for themselves.
+  //
+  // This only binds in the delay-bound regime. Above roughly 20,000 logs/sec
+  // batches reach minBatchRows before the timer expires (measured mean batch
+  // 3,231-3,473 rows at 30,000 offered), so Stress and Breakpoint are
+  // unaffected; the value matters for Load and the Spike baseline.
+  //
+  // Env-overridable only so the sweep can be repeated without a rebuild.
+  maxBatchDelayMs: Number(process.env.INGEST_BATCH_DELAY_MS) || 10,
   maxPendingRows: 50_000,
   // maxConcurrentFlushes is deliberately left at its default of 1. Overlapping
   // flushes were implemented and swept (1 vs 3) against a real database and

@@ -120,7 +120,27 @@ systemPool.on('error', logPoolError('system'));
 // entirely; at ~200 bytes retained per serialized row it is ~10MB.
 // See src/ingest/ingest-pipeline.ts for the full rationale.
 const pipeline = new IngestPipeline(ingestPool, {
-  minBatchRows: 4000,
+  // Swept in both directions, two runs each, at 15,000 logs/sec offered
+  // (scenario score out of 50; latency is p95 across all requests):
+  //
+  //   rows   logs/sec   latency p95   score
+  //   2000     14,717        543ms    43.69
+  //   2000     14,741        483ms    43.38
+  //   4000     14,903        353ms    45.77
+  //   4000     14,422        493ms    42.55
+  //   8000     12,363       2426ms    25.60
+  //
+  // 2,000 and 4,000 are within run-to-run noise of each other; 8,000 falls off
+  // a cliff, because a flush that large keeps the single ingest transaction
+  // busy long enough that arriving requests queue behind it. 4,000 is kept as
+  // the default on the strength of its best case and its higher mean.
+  //
+  // Offered load has to stay near 15,000 for this sweep to mean anything. An
+  // earlier version of it ran at 30,000 — far past what the box can absorb —
+  // and every configuration collapsed to a latency p95 over 1s, which scores
+  // 0/10 regardless. In that regime the sweep was measuring queue depth, not
+  // batch size, and it ranked the settings differently on every repeat.
+  minBatchRows: Number(process.env.INGEST_MIN_BATCH_ROWS) || 4000,
   // Dominant term in ingestion response latency: a request cannot be answered
   // until its batch commits, so this sets the floor on how long a POST takes.
   //

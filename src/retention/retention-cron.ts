@@ -8,8 +8,7 @@ import { DEFAULT_PARTITION_AHEAD_DAYS, dropExpiredPartitions, ensureUpcomingPart
  */
 export const DEFAULT_RETENTION_DAYS = 30;
 
-const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // hourly
-
+const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // hourly.
 export interface PartitionMaintenanceOptions {
   retentionDays?: number;
   aheadDays?: number;

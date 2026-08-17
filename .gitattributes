@@ -1,0 +1,15 @@
+# Shell scripts must keep LF endings on every platform. Git's core.autocrlf
+# is commonly `true` on Windows, which rewrites LF to CRLF on checkout; a
+# CRLF shebang line makes the kernel look for an interpreter named
+# "/usr/bin/env bash\r", and the script fails with a confusing "not found".
+# That breaks CI and anything running these scripts inside a Linux container,
+# on a clone that looks byte-identical in an editor.
+*.sh text eol=lf
+
+# Same reasoning for files consumed by Linux tooling inside the image.
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Let Git handle the rest normally.
+* text=auto

@@ -3,3 +3,10 @@ dist/
 .env
 .env.*
 *.md
+# Local benchmark output. The CLI writes these when run with --json, and the
+# numbers are specific to the machine that produced them -- a run on a slow
+# host reports a HIGHER score, because the load generator shares its CPU with
+# the service and cannot apply full load. Committing them would put a figure
+# in the repo that does not describe the service. Measured results belong in
+# the README, sourced from the graded platform.
+benchmark-report*.json

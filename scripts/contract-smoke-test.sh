@@ -75,10 +75,6 @@ BAD_JSON_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/logs
 [ "$BAD_JSON_STATUS" = "400" ] || fail "POST /logs with malformed JSON expected 400, got $BAD_JSON_STATUS"
 echo "OK: POST /logs malformed JSON -> 400"
 
-# Let the async flush loop COPY the accepted row before querying for it.
-# Freshness target is 20s; the flush interval is ~50ms, a few seconds is
-# a comfortable margin.
-sleep 3
 
 # --- GET /logs ---
 echo "--- GET /logs ---"
@@ -88,7 +84,14 @@ QUERY_JSON=$(echo "$QUERY_RES" | sed '$d')
 [ "$QUERY_STATUS" = "200" ] || fail "GET /logs expected 200, got $QUERY_STATUS: $QUERY_JSON"
 echo "$QUERY_JSON" | grep -q '"logs"' || fail "GET /logs response missing 'logs' field: $QUERY_JSON"
 echo "$QUERY_JSON" | grep -q '"next_cursor"' || fail "GET /logs response missing 'next_cursor' field: $QUERY_JSON"
-echo "OK: GET /logs -> 200 with logs[] and next_cursor"
+# Group commit means POST /logs is answered only after its COMMIT returns, so
+# the row accepted a moment ago must be visible on the very next request --
+# no sleep and no retry. Asserting that here turns this from a shape check
+# into a read-after-write proof of the central design decision. It replaces
+# a "sleep 3" that dated from the earlier async-flush architecture, and that
+# was guarding an assertion which would have passed on an empty result set.
+echo "$QUERY_JSON" | grep -q 'contract smoke test' || fail "GET /logs did not return the row accepted by the immediately preceding POST -- read-after-write violated: $QUERY_JSON"
+echo "OK: GET /logs -> 200, logs[] and next_cursor present, and the just-written row is visible with no delay"
 
 # --- GET /logs with an invalid parameter -> 400 {"error": "..."} ---
 echo "--- GET /logs (invalid level) ---"
